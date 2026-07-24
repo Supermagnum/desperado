@@ -168,6 +168,22 @@ struct TuiState {
     gain_change_request: Option<f64>, // written by TUI thread, consumed by main loop
 }
 
+fn should_pause_for_tui_selection(
+    tui_enabled: bool,
+    is_file_source: bool,
+    has_cli_service: bool,
+    msc_initialized: bool,
+    frame_count: usize,
+    has_selectable_service: bool,
+) -> bool {
+    tui_enabled
+        && is_file_source
+        && !has_cli_service
+        && !msc_initialized
+        && frame_count >= 50
+        && has_selectable_service
+}
+
 struct TuiGuard {
     running: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -622,17 +638,23 @@ struct Cli {
     #[arg(short = 'f', long)]
     freq: Option<u32>,
 
-    /// IQ format for file sources: cu8, cs8, cs16, cf32
-    #[arg(long, default_value = "cu8")]
-    format: String,
+    /// IQ format for file sources: cu8, cs8, cs16, cf32 (auto-detected from GQRX
+    /// file names; defaults to cu8)
+    #[arg(long)]
+    format: Option<String>,
 
     /// Input sample rate in samples/s (needed for non-2.048MS/s file/stdin sources)
     #[arg(long)]
     sample_rate: Option<u32>,
 
-    /// Shift input IQ by this frequency before demodulation (Hz)
-    #[arg(long, default_value = "0")]
-    freq_shift_hz: i32,
+    /// RF center frequency of the captured signal, in Hz (auto-detected from
+    /// GQRX file names; defaults to the selected multiplex, i.e. no downconversion
+    /// shift). For live SDR, sets the device tune center when the URI does not
+    /// specify one — meaningful for wideband/high-rate sources such as HACKRF
+    /// (to dodge a DC spike), not useful for RTL-SDR where bandwidth == sample
+    /// rate.
+    #[arg(long)]
+    center_freq: Option<u32>,
 
     /// List services and exit (no audio)
     #[arg(long)]
@@ -654,7 +676,7 @@ struct Cli {
     #[arg(long)]
     service: Option<String>,
 
-    /// Output file for decoded data (raw DAB+ logical frames)
+    /// Output file for decoded MSC logical frames (DAB+ or legacy DAB)
     #[arg(short, long)]
     output: Option<String>,
 
@@ -771,22 +793,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Parse IQ format
-    let iq_format = match cli.format.as_str() {
-        "cu8" => IqFormat::Cu8,
-        "cs8" => IqFormat::Cs8,
-        "cs16" => IqFormat::Cs16,
-        "cf32" => IqFormat::Cf32,
-        other => return Err(format!("Unknown IQ format: {}", other).into()),
-    };
-
-    info!(
-        "Opening {} (freq={} Hz, format={})",
-        source, center_freq, cli.format
-    );
-
-    // Open IQ source (file or live SDR URI)
-    // - stdin/file: use --sample-rate when provided
+    // Open IQ source (file or live SDR URI).
+    //
+    // Parameter resolution for file/stdin sources, with precedence:
+    //   explicit CLI flag  >  GQRX filename auto-detect  >  existing default
+    // For live SDR, GQRX detection is skipped (the source is a device URI).
+    //
+    // - stdin/file: use --sample-rate / --format when provided
     // - airspy://: 4.096 MS/s IQ (matching welle.io's approach).
     //   4096000 is not in firmware's supported list [6M, 3M], so the kHz fallback
     //   sends 4096000*2/1000 = 8192 kHz to firmware. ADC runs at 8.192 MHz real,
@@ -794,25 +807,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //   DabResampler::Half then does 2:1 pair-averaging → 2.048M (DAB native rate).
     //   This avoids fractional resampling, giving clean OFDM sync.
     // - others default: 2.048 MS/s
-    let default_input_rate = cli.sample_rate.unwrap_or_else(|| {
-        if source.starts_with("airspy://") {
-            4_096_000
-        } else {
-            constants::SAMPLE_RATE
+    let is_device = is_device_uri(source);
+    let gqrx_meta = if !is_device {
+        desperado::gqrx::parse_gqrx_filename(source)
+    } else {
+        None
+    };
+
+    // Resolve the actual RF center of the captured signal:
+    //   explicit --center-freq  >  GQRX filename  >  selected multiplex (no shift)
+    // The default (== multiplex frequency) yields a zero downconversion shift,
+    // preserving behavior for narrowband captures centred on the channel. For
+    // live SDR the device is tuned to this resolved center; a non-default value
+    // (e.g. an off-channel HACKRF tune to dodge a DC spike) is compensated by
+    // the rotator below. (Meaningful for wideband/high-rate sources; not useful
+    // for RTL-SDR where bandwidth == sample rate.)
+    let input_center = if let Some(hz) = cli.center_freq {
+        hz
+    } else if let Some(meta) = gqrx_meta {
+        meta.center_freq_hz
+    } else {
+        center_freq
+    };
+    let shift_hz: i32 = center_freq as i32 - input_center as i32;
+
+    let iq_format = if let Some(fmt) = &cli.format {
+        match fmt.as_str() {
+            "cu8" => IqFormat::Cu8,
+            "cs8" => IqFormat::Cs8,
+            "cs16" => IqFormat::Cs16,
+            "cf32" => IqFormat::Cf32,
+            other => return Err(format!("Unknown IQ format: {}", other).into()),
         }
-    });
+    } else if let Some(meta) = gqrx_meta {
+        meta.format
+    } else {
+        IqFormat::Cu8
+    };
+
+    let default_input_rate = if source.starts_with("airspy://") {
+        4_096_000
+    } else {
+        constants::SAMPLE_RATE
+    };
+    let input_rate = if let Some(r) = cli.sample_rate {
+        r
+    } else if let Some(meta) = gqrx_meta {
+        meta.sample_rate_hz
+    } else {
+        default_input_rate
+    };
+
+    if let Some(meta) = gqrx_meta {
+        info!(
+            center_freq_hz = meta.center_freq_hz,
+            sample_rate_hz = meta.sample_rate_hz,
+            format = %meta.format,
+            "Auto-detected GQRX capture parameters from file name"
+        );
+    }
+    info!(
+        "Opening {} (multiplex={} Hz, input_center={} Hz, shift={} Hz, rate={} Hz, format={})",
+        source, center_freq, input_center, shift_hz, input_rate, iq_format
+    );
+
     let is_rtlsdr_uri = source.starts_with("rtlsdr://");
     let source_uri = source.to_string();
 
     let chunk_size = constants::T_F; // One frame's worth of samples
-    let (mut source, is_file_source, input_sample_rate, effective_gain) = open_iq_source(
-        source,
-        center_freq,
-        default_input_rate,
-        chunk_size,
-        iq_format,
-    )
-    .await?;
+    let (mut source, is_file_source, input_sample_rate, effective_gain) =
+        open_iq_source(source, input_center, input_rate, chunk_size, iq_format).await?;
     // Round startup discard to the nearest whole T_F so the OFDM processor
     // always receives its first chunk on a frame boundary. A non-multiple of
     // T_F causes a partial first chunk that forces the null-symbol detector
@@ -844,8 +908,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MSC decoding state (initialized once we know the service -> subchannel mapping)
     let mut msc_handler: Option<msc::MscHandler> = None;
     let mut dab_plus_decoder: Option<audio::DabPlusDecoder> = None;
+    let mut mp2_decoder: Option<audio::mp2::Mp2Decoder> = None;
     let mut msc_output: Vec<Vec<u8>> = Vec::new();
-    let decoding_service = cli.service.is_some();
+    let mut decoding_service = cli.service.is_some();
     let selected_service_sid = cli.service.as_deref().and_then(parse_service_id_arg);
     let mut announced_service_label = false;
     let mut mot_image_count = 0usize;
@@ -899,13 +964,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let mut iq_rotator = if cli.freq_shift_hz != 0 {
-        let angle = -2.0f32 * std::f32::consts::PI * (cli.freq_shift_hz as f32)
-            / (input_sample_rate as f32);
-        info!(
-            shift_hz = cli.freq_shift_hz,
-            "Applying input frequency shift"
-        );
+    let mut iq_rotator = if shift_hz != 0 {
+        let angle = -2.0f32 * std::f32::consts::PI * (shift_hz as f32) / (input_sample_rate as f32);
+        info!(shift_hz, "Applying input frequency shift");
         Some(Rotate::new(angle))
     } else {
         None
@@ -1022,7 +1083,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let mut wav_writer = if decoding_service {
+    let mut wav_writer = if decoding_service || tui_enabled {
         if let Some(path) = &cli.wav {
             Some(WavWriter::create(path, AUDIO_RATE as u32, 2)?)
         } else {
@@ -1034,6 +1095,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut main_loop_iter = 0usize;
     while app_running.load(Ordering::Relaxed) {
+        // For file playback, stop consuming the recording once the TUI has a
+        // selectable service list. Without this pause the decoder races to EOF
+        // before the user can press Enter, making the TUI appear to crash.
+        // This control-flow decision must not use try_lock: the TUI redraw
+        // thread can otherwise win the mutex on every fast file-input loop and
+        // let the main thread race all the way to EOF.
+        let has_selectable_service = tui_state
+            .lock()
+            .ok()
+            .is_some_and(|s| !s.services.is_empty());
+        // Let several FIG label cycles pass before pausing; stopping as soon
+        // as the first labels arrive leaves an incomplete menu.
+        if should_pause_for_tui_selection(
+            tui_enabled,
+            is_file_source,
+            cli.service.is_some(),
+            msc_handler.is_some(),
+            frame_count,
+            has_selectable_service,
+        ) {
+            if let Ok(mut s) = tui_state.lock() {
+                s.status = "select a service".to_string();
+            }
+            while app_running.load(Ordering::Relaxed) && msc_handler.is_none() {
+                if apply_tui_service_switch(
+                    &mut ensemble,
+                    &tui_state,
+                    &mut msc_handler,
+                    &mut dab_plus_decoder,
+                    &mut mp2_decoder,
+                    &audio_primed,
+                    &mut announced_service_label,
+                ) {
+                    decoding_service = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if !app_running.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+
         // Use a timeout so we periodically re-check app_running even if the
         // SDR source blocks (device error, USB stall, etc.).
         let chunk_result = loop {
@@ -1069,6 +1173,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let keep_from = startup_discard_samples;
             startup_discard_samples = 0;
             samples = samples.split_off(keep_from);
+        }
+        // Remove the SDR/capture DC offset from the raw (pre-rotation) samples
+        // when downconverting. The DC spike sits at the capture center; once
+        // rotated it becomes a tone at the shift frequency that can land in or
+        // near the wanted band and corrupt a weak multiplex (e.g. a neighbour
+        // only ~1 MHz from the capture center). Subtracted before rotation, it
+        // is removed regardless of the target channel. Gated on shift != 0 so
+        // existing on-channel paths (DC at the DAB null carrier) are untouched.
+        if shift_hz != 0 && !samples.is_empty() {
+            let mean = samples
+                .iter()
+                .fold(Complex::new(0.0f32, 0.0f32), |acc, s| acc + *s)
+                / samples.len() as f32;
+            for s in samples.iter_mut() {
+                *s -= mean;
+            }
         }
         let samples = if let Some(ref mut rotator) = iq_rotator {
             rotator.process(&samples)
@@ -1167,11 +1287,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 if let Ok(mut s) = tui_state.try_lock() {
-                    s.status = if fib_count > 0 {
-                        "sync + FIC OK".to_string()
-                    } else {
-                        "OFDM sync only".to_string()
-                    };
+                    if s.service.is_empty() {
+                        s.status = if fib_count > 0 {
+                            "sync + FIC OK".to_string()
+                        } else {
+                            "OFDM sync only".to_string()
+                        };
+                    }
                     // Ensemble name
                     if s.ensemble_name.is_empty()
                         && let Some(name) = &ensemble.ensemble_label
@@ -1260,10 +1382,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if decoding_service && msc_handler.is_none() && ensemble.has_services() {
                 ensemble.resolve_services();
                 if let Some(ref service_arg) = cli.service
-                    && let Some((handler, bitrate)) = try_init_msc(&ensemble, service_arg)
+                    && let Some((handler, bitrate, coding)) = try_init_msc(&ensemble, service_arg)
                 {
                     msc_handler = Some(handler);
-                    dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
+                    match coding {
+                        fic::fib::AudioCoding::DabPlus => {
+                            dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
+                            mp2_decoder = None;
+                        }
+                        fic::fib::AudioCoding::MpegLayer2 => {
+                            dab_plus_decoder = None;
+                            mp2_decoder = Some(audio::mp2::Mp2Decoder::new());
+                        }
+                        fic::fib::AudioCoding::Other(_) => unreachable!(),
+                    }
                     if let Ok(mut s) = tui_state.try_lock() {
                         s.status = format!("decoding @ {} kbps", bitrate);
                         if s.service.is_empty() {
@@ -1274,33 +1406,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Service switch request from TUI Enter key
-            if tui_enabled && ensemble.has_services() {
-                let switch_to = tui_state
-                    .try_lock()
-                    .ok()
-                    .and_then(|mut s| s.service_switch_request.take());
-                if let Some(ref label) = switch_to {
-                    ensemble.resolve_services();
-                    if let Some((new_handler, bitrate)) = try_init_msc(&ensemble, label) {
-                        msc_handler = Some(new_handler);
-                        dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
-                        audio_primed.store(false, Ordering::Relaxed);
-                        announced_service_label = true; // suppress old --service label logic
-                        info!(service = %label, bitrate, "Switching service");
-                        if let Ok(mut s) = tui_state.try_lock() {
-                            s.service = label.clone();
-                            s.status = format!("decoding @ {} kbps", bitrate);
-                            s.dls.clear();
-                            s.mot_count = 0;
-                            s.mot_info.clear();
-                            s.mot_filename = None;
-                            s.mot_preview_path = None;
-                            s.clear_mot_image = true;
-                        }
-                    } else {
-                        warn!(service = %label, "Service switch failed: subchannel not ready yet");
-                    }
-                }
+            if tui_enabled
+                && ensemble.has_services()
+                && apply_tui_service_switch(
+                    &mut ensemble,
+                    &tui_state,
+                    &mut msc_handler,
+                    &mut dab_plus_decoder,
+                    &mut mp2_decoder,
+                    &audio_primed,
+                    &mut announced_service_label,
+                )
+            {
+                decoding_service = true;
             }
 
             // Gain change request from TUI +/- keys
@@ -1522,6 +1640,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
+                        // Legacy DAB: each UEP-decoded logical frame carries
+                        // MPEG Audio Layer II bytes rather than a DAB+ superframe.
+                        if let Some(ref mut mp2_dec) = mp2_decoder {
+                            let decoded_out = mp2_dec.feed_frame(&decoded);
+                            let sample_rate = decoded_out.sample_rate;
+                            let channels = decoded_out.channels;
+                            let pcm = match decoded_out.into_stereo_48k() {
+                                Some(pcm) => pcm,
+                                None => {
+                                    warn!(
+                                        sample_rate,
+                                        channels,
+                                        "Legacy DAB PCM format is not supported by the 48 kHz output path"
+                                    );
+                                    Vec::new()
+                                }
+                            };
+
+                            if !pcm.is_empty() && _device.is_some() {
+                                if !first_pcm_logged {
+                                    first_pcm_logged = true;
+                                    info!(
+                                        prebuffer_samples = audio_prebuffer_samples,
+                                        "First PCM samples from MP2 decoder — filling prebuffer"
+                                    );
+                                }
+                                tokio::task::block_in_place(|| {
+                                    for sample in &pcm {
+                                        loop {
+                                            match tx
+                                                .send_timeout(*sample, Duration::from_millis(100))
+                                            {
+                                                Ok(()) => break,
+                                                Err(channel::SendTimeoutError::Timeout(_)) => {
+                                                    if !app_running.load(Ordering::Relaxed) {
+                                                        return;
+                                                    }
+                                                }
+                                                Err(channel::SendTimeoutError::Disconnected(_)) => {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                                if !audio_primed_logged && audio_primed.load(Ordering::Relaxed) {
+                                    audio_primed_logged = true;
+                                    info!(queue_fill = tx.len(), "Audio primed — playback started");
+                                }
+                                if let Ok(mut s) = tui_state.try_lock() {
+                                    s.audio_q_fill = tx.len();
+                                }
+                            }
+
+                            if let Some(writer) = wav_writer.as_mut()
+                                && !pcm.is_empty()
+                            {
+                                writer.write_samples_f32(&pcm)?;
+                            }
+                        }
+
                         // Optionally collect raw frames for file output
                         if cli.output.is_some() {
                             msc_output.push(decoded);
@@ -1581,6 +1760,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rs_errors = sf.rs_errors,
                 au_crc_errors = sf.au_crc_errors,
                 "DAB+ decode summary"
+            );
+        }
+        if let Some(ref mp2_dec) = mp2_decoder {
+            info!(
+                frames = mp2_dec.frames_decoded,
+                decode_errors = mp2_dec.decode_errors,
+                sync_bytes_skipped = mp2_dec.sync_bytes_skipped,
+                sample_rate = mp2_dec.sample_rate,
+                channels = mp2_dec.channels,
+                "Legacy DAB MP2 decode summary"
             );
         }
 
@@ -1910,7 +2099,7 @@ fn show_image_in_terminal(
 fn try_init_msc(
     ensemble: &fic::fib::EnsembleInfo,
     service_arg: &str,
-) -> Option<(msc::MscHandler, u16)> {
+) -> Option<(msc::MscHandler, u16, fic::fib::AudioCoding)> {
     // Try to match by hex SId (e.g. "0xF201") or by label (case-insensitive)
     let target_sid = parse_service_id_arg(service_arg);
 
@@ -1930,11 +2119,18 @@ fn try_init_msc(
     let subch_id = service.subchannel_id?;
     let subch = ensemble.subchannels.get(&subch_id)?;
     let bitrate = subch.bitrate;
+    let coding = service.audio_coding?;
+    if matches!(coding, fic::fib::AudioCoding::Other(_)) {
+        warn!(?coding, "Unsupported DAB audio component type");
+        return None;
+    }
 
     info!(
         label = %service.label.as_deref().unwrap_or("(label pending)"),
         service_id = format_args!("0x{:04X}", service.service_id),
         subchannel_id = subch_id,
+        subchannel_size_cu = subch.sub_size,
+        uep_table_index = ?subch.uep_table_index,
         bitrate_kbps = bitrate,
         protection = %if subch.is_eep {
             let opt = if subch.eep_option == 0 { "A" } else { "B" };
@@ -1942,6 +2138,7 @@ fn try_init_msc(
         } else {
             format!("UEP {}", subch.protection_level)
         },
+        ?coding,
         "Decoding service"
     );
 
@@ -1949,7 +2146,59 @@ fn try_init_msc(
     if handler.is_none() {
         warn!(subchannel_id = subch_id, "Failed to initialize MSC handler");
     }
-    handler.map(|h| (h, bitrate))
+    handler.map(|h| (h, bitrate, coding))
+}
+
+/// Consume and apply one pending TUI service selection.
+fn apply_tui_service_switch(
+    ensemble: &mut fic::fib::EnsembleInfo,
+    tui_state: &Arc<Mutex<TuiState>>,
+    msc_handler: &mut Option<msc::MscHandler>,
+    dab_plus_decoder: &mut Option<audio::DabPlusDecoder>,
+    mp2_decoder: &mut Option<audio::mp2::Mp2Decoder>,
+    audio_primed: &AtomicBool,
+    announced_service_label: &mut bool,
+) -> bool {
+    let switch_to = tui_state
+        .try_lock()
+        .ok()
+        .and_then(|mut state| state.service_switch_request.take());
+    let Some(label) = switch_to else {
+        return false;
+    };
+
+    ensemble.resolve_services();
+    let Some((new_handler, bitrate, coding)) = try_init_msc(ensemble, &label) else {
+        warn!(service = %label, "Service switch failed: subchannel not ready yet");
+        return false;
+    };
+
+    *msc_handler = Some(new_handler);
+    match coding {
+        fic::fib::AudioCoding::DabPlus => {
+            *dab_plus_decoder = Some(audio::DabPlusDecoder::new(bitrate));
+            *mp2_decoder = None;
+        }
+        fic::fib::AudioCoding::MpegLayer2 => {
+            *dab_plus_decoder = None;
+            *mp2_decoder = Some(audio::mp2::Mp2Decoder::new());
+        }
+        fic::fib::AudioCoding::Other(_) => unreachable!(),
+    }
+    audio_primed.store(false, Ordering::Relaxed);
+    *announced_service_label = true;
+    info!(service = %label, bitrate, "Switching service");
+    if let Ok(mut state) = tui_state.try_lock() {
+        state.service = label;
+        state.status = format!("decoding @ {} kbps", bitrate);
+        state.dls.clear();
+        state.mot_count = 0;
+        state.mot_info.clear();
+        state.mot_filename = None;
+        state.mot_preview_path = None;
+        state.clear_mot_image = true;
+    }
+    true
 }
 
 fn print_services(ensemble: &fic::fib::EnsembleInfo, json: bool) {
@@ -2084,5 +2333,28 @@ mod tests {
             "hackrf://?amp=false&freq=223936000&rate=2048000&gain=72"
         );
         assert_eq!(effective_gain, Some(72.0));
+    }
+
+    #[test]
+    fn file_tui_pauses_for_service_selection_after_label_cycles() {
+        assert!(!should_pause_for_tui_selection(
+            true, true, false, false, 49, true
+        ));
+        assert!(should_pause_for_tui_selection(
+            true, true, false, false, 50, true
+        ));
+    }
+
+    #[test]
+    fn tui_does_not_pause_live_or_preselected_decoding() {
+        assert!(!should_pause_for_tui_selection(
+            true, false, false, false, 50, true
+        ));
+        assert!(!should_pause_for_tui_selection(
+            true, true, true, false, 50, true
+        ));
+        assert!(!should_pause_for_tui_selection(
+            true, true, false, true, 50, true
+        ));
     }
 }

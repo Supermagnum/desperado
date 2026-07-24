@@ -21,6 +21,7 @@ use std::task::{Context, Poll};
 pub mod airspy;
 pub mod dsp;
 pub mod error;
+pub mod gqrx;
 #[cfg(feature = "hackrf")]
 pub mod hackrf;
 pub mod iqread;

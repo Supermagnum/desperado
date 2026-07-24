@@ -814,6 +814,7 @@ dependencies = [
  "fdk-aac",
  "futures",
  "num-complex",
+ "oxideav-mp2",
  "ratatui",
  "reed-solomon",
  "rustfft",
@@ -2157,6 +2158,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "oxideav-core"
+version = "0.1.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c35bccec0ce0967c6ba505aca16bad585ece6ef581c8f784924272093d887987"
+dependencies = [
+ "bytemuck",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "oxideav-mp2"
+version = "0.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d078671403ba6f7efd48d8580cad13a046812c420f63eacb140ee3a0966d374e"
+dependencies = [
+ "oxideav-core",
 ]
 
 [[package]]

@@ -22,6 +22,27 @@ pub struct EnsembleInfo {
     pub subchannels: HashMap<u8, SubchannelInfo>,
 }
 
+/// Audio coding signalled by FIG 0/2 ASCTy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum AudioCoding {
+    /// ASCTy 0: legacy DAB MPEG-1/2 Audio Layer II.
+    MpegLayer2,
+    /// ASCTy 63: DAB+ HE-AAC.
+    DabPlus,
+    /// A stream-audio component type not yet supported.
+    Other(u8),
+}
+
+impl AudioCoding {
+    fn from_ascty(ascty: u8) -> Self {
+        match ascty {
+            0 => Self::MpegLayer2,
+            63 => Self::DabPlus,
+            other => Self::Other(other),
+        }
+    }
+}
+
 /// Information about a single DAB service.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ServiceInfo {
@@ -29,6 +50,7 @@ pub struct ServiceInfo {
     pub label: Option<String>,
     pub subchannel_id: Option<u8>,
     pub is_audio: bool,
+    pub audio_coding: Option<AudioCoding>,
     pub bitrate: Option<u16>,
     pub protection: Option<String>,
 }
@@ -42,6 +64,8 @@ pub struct SubchannelInfo {
     pub protection_level: u8,
     pub is_eep: bool,
     pub eep_option: u8, // 0 = EEP-A, 1 = EEP-B (only meaningful when is_eep=true)
+    /// FIG 0/1 short-form UEP table index; absent for EEP long form.
+    pub uep_table_index: Option<u8>,
     pub bitrate: u16,
 }
 
@@ -138,7 +162,14 @@ impl EnsembleInfo {
             let form = (data[pos + 2] >> 7) & 1;
 
             if form == 0 {
-                // Short form: table-driven (UEP)
+                // Short form: table-driven (UEP). Table Switch=1 is
+                // reserved for future use and its low six bits must not be
+                // interpreted using the current table.
+                let table_switch = (data[pos + 2] >> 6) & 1;
+                if table_switch != 0 {
+                    pos += 3;
+                    continue;
+                }
                 let table_index = data[pos + 2] & 0x3F;
                 let (sub_size, bitrate, prot_level) = uep_table(table_index);
                 self.subchannels.insert(
@@ -150,6 +181,7 @@ impl EnsembleInfo {
                         protection_level: prot_level,
                         is_eep: false,
                         eep_option: 0,
+                        uep_table_index: Some(table_index),
                         bitrate,
                     },
                 );
@@ -172,6 +204,7 @@ impl EnsembleInfo {
                         protection_level: prot_level,
                         is_eep: true,
                         eep_option: option,
+                        uep_table_index: None,
                         bitrate,
                     },
                 );
@@ -219,6 +252,7 @@ impl EnsembleInfo {
                 }
                 let tmid = (data[pos] >> 6) & 0x03;
                 let is_audio = tmid == 0; // 0 = MSC stream audio
+                let ascty = data[pos] & 0x3F;
 
                 // FIG 0/2 component descriptor (ETSI EN 300 401 §6.3.1):
                 //   Byte 0: TMId(2) | ASCTy/DSCTy(6)
@@ -233,9 +267,16 @@ impl EnsembleInfo {
                     service_id: sid,
                     ..Default::default()
                 });
-                service.is_audio = is_audio;
-                if let Some(sc_id) = subch_id {
-                    service.subchannel_id = Some(sc_id);
+                let primary = (data[pos + 1] >> 1) & 1 != 0;
+                // A service can have audio plus data/secondary components. Never
+                // let a later data descriptor clear the selected audio codec;
+                // prefer the primary audio component when one is signalled.
+                if is_audio && (service.audio_coding.is_none() || primary) {
+                    service.is_audio = true;
+                    service.audio_coding = Some(AudioCoding::from_ascty(ascty));
+                    if let Some(sc_id) = subch_id {
+                        service.subchannel_id = Some(sc_id);
+                    }
                 }
 
                 pos += 2;
@@ -378,67 +419,76 @@ fn trim_label_padding(bytes: &[u8]) -> &[u8] {
 /// Returns (sub_size in CUs, bitrate in kbps, protection_level).
 /// Reference: ETSI EN 300 401 Table 6.
 fn uep_table(index: u8) -> (u16, u16, u8) {
-    // Simplified table — maps table_index to (size, bitrate, protection_level)
-    // Full table has 64 entries; these are the most common ones.
-    match index {
-        0 => (16, 32, 1),
-        1 => (21, 32, 2),
-        2 => (24, 32, 3),
-        3 => (29, 32, 4),
-        4 => (35, 32, 5),
-        5 => (24, 48, 1),
-        6 => (29, 48, 2),
-        7 => (35, 48, 3),
-        8 => (42, 48, 4),
-        9 => (52, 48, 5),
-        10 => (29, 56, 1),
-        11 => (35, 56, 2),
-        12 => (42, 56, 3),
-        13 => (52, 56, 4),
-        14 => (32, 64, 1),
-        15 => (42, 64, 2),
-        16 => (48, 64, 3),
-        17 => (58, 64, 4),
-        18 => (40, 80, 1),
-        19 => (52, 80, 2),
-        20 => (58, 80, 3),
-        21 => (70, 80, 4),
-        22 => (48, 96, 1),
-        23 => (58, 96, 2),
-        24 => (70, 96, 3),
-        25 => (84, 96, 4),
-        26 => (58, 112, 1),
-        27 => (70, 112, 2),
-        28 => (84, 112, 3),
-        29 => (104, 112, 4),
-        30 => (64, 128, 1),
-        31 => (84, 128, 2),
-        32 => (96, 128, 3),
-        33 => (116, 128, 4),
-        34 => (80, 160, 1),
-        35 => (104, 160, 2),
-        36 => (116, 160, 3),
-        37 => (140, 160, 4),
-        38 => (96, 192, 1),
-        39 => (116, 192, 2),
-        40 => (140, 192, 3),
-        41 => (168, 192, 4),
-        42 => (116, 224, 1),
-        43 => (140, 224, 2),
-        44 => (168, 224, 3),
-        45 => (208, 224, 4),
-        46 => (128, 256, 1),
-        47 => (168, 256, 2),
-        48 => (192, 256, 3),
-        49 => (232, 256, 4),
-        50 => (160, 320, 1),
-        51 => (208, 320, 2),
-        52 => (280, 320, 3),
-        53 => (192, 384, 1),
-        54 => (280, 384, 2),
-        55 => (416, 384, 3),
-        _ => (0, 0, 0),
-    }
+    // Complete ETSI EN 300 401 FIG 0/1 short-form table. UEP level 1
+    // is strongest and level 5 weakest. Keep all 64 rows: omitting rows
+    // shifts every later on-air index and selects the wrong bitrate/FEC profile.
+    const TABLE: [(u16, u16, u8); 64] = [
+        (16, 32, 5),
+        (21, 32, 4),
+        (24, 32, 3),
+        (29, 32, 2),
+        (35, 32, 1),
+        (24, 48, 5),
+        (29, 48, 4),
+        (35, 48, 3),
+        (42, 48, 2),
+        (52, 48, 1),
+        (29, 56, 5),
+        (35, 56, 4),
+        (42, 56, 3),
+        (52, 56, 2),
+        (32, 64, 5),
+        (42, 64, 4),
+        (48, 64, 3),
+        (58, 64, 2),
+        (70, 64, 1),
+        (40, 80, 5),
+        (52, 80, 4),
+        (58, 80, 3),
+        (70, 80, 2),
+        (84, 80, 1),
+        (48, 96, 5),
+        (58, 96, 4),
+        (70, 96, 3),
+        (84, 96, 2),
+        (104, 96, 1),
+        (58, 112, 5),
+        (70, 112, 4),
+        (84, 112, 3),
+        (104, 112, 2),
+        (64, 128, 5),
+        (84, 128, 4),
+        (96, 128, 3),
+        (116, 128, 2),
+        (140, 128, 1),
+        (80, 160, 5),
+        (104, 160, 4),
+        (116, 160, 3),
+        (140, 160, 2),
+        (168, 160, 1),
+        (96, 192, 5),
+        (116, 192, 4),
+        (140, 192, 3),
+        (168, 192, 2),
+        (208, 192, 1),
+        (116, 224, 5),
+        (140, 224, 4),
+        (168, 224, 3),
+        (208, 224, 2),
+        (232, 224, 1),
+        (128, 256, 5),
+        (168, 256, 4),
+        (192, 256, 3),
+        (232, 256, 2),
+        (280, 256, 1),
+        (160, 320, 5),
+        (208, 320, 4),
+        (280, 320, 2),
+        (192, 384, 5),
+        (280, 384, 3),
+        (416, 384, 1),
+    ];
+    TABLE[index as usize]
 }
 
 /// Compute EEP bitrate from sub-channel size, option, and protection level.
@@ -471,7 +521,8 @@ fn eep_bitrate(sub_size: u16, option: u8, protection_level: u8) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_label;
+    use super::{AudioCoding, EnsembleInfo, decode_label, uep_table};
+    use crate::fec::uep::{profile, punctured_size};
 
     #[test]
     fn decode_label_trims_nul_padding_before_ebu_conversion() {
@@ -489,5 +540,58 @@ mod tests {
     fn decode_label_keeps_internal_reserved_bytes_visible() {
         let label = decode_label(b"A\0B\0\0", 0);
         assert_eq!(label, "A�B");
+    }
+
+    #[test]
+    fn complete_uep_table_keeps_profiles_and_allocations_aligned() {
+        assert_eq!(uep_table(35), (96, 128, 3));
+        assert_eq!(uep_table(63), (416, 384, 1));
+        for index in 0..64 {
+            let (capacity_units, bitrate, level) = uep_table(index);
+            let coding = profile(bitrate, level).unwrap();
+            let padding = capacity_units as usize * 64 - punctured_size(&coding);
+            assert!(matches!(padding, 0 | 4 | 8), "table index {index}");
+        }
+    }
+
+    #[test]
+    fn audio_component_type_selects_codec() {
+        assert_eq!(AudioCoding::from_ascty(0), AudioCoding::MpegLayer2);
+        assert_eq!(AudioCoding::from_ascty(63), AudioCoding::DabPlus);
+        assert_eq!(AudioCoding::from_ascty(7), AudioCoding::Other(7));
+    }
+
+    #[test]
+    fn short_form_rejects_reserved_table_switch() {
+        let mut decoder = EnsembleInfo::new();
+        decoder.parse_fig0_ext1(&[0, 0, 0x40 | 35]);
+        assert!(decoder.subchannels.is_empty());
+
+        decoder.parse_fig0_ext1(&[0, 0, 35]);
+        let subchannel = decoder.subchannels.get(&0).unwrap();
+        assert_eq!(subchannel.bitrate, 128);
+        assert_eq!(subchannel.protection_level, 3);
+    }
+
+    #[test]
+    fn data_component_does_not_clear_primary_audio_codec() {
+        let mut decoder = EnsembleInfo::new();
+        // Service 0x1234, two components: primary ASCTy 0 on subchannel 1,
+        // followed by a packet-data component.
+        decoder.parse_fig0_ext2(&[0x12, 0x34, 2, 0, (1 << 2) | 2, 3 << 6, 0], 0);
+        let service = decoder.services.get(&0x1234).unwrap();
+        assert!(service.is_audio);
+        assert_eq!(service.subchannel_id, Some(1));
+        assert_eq!(service.audio_coding, Some(AudioCoding::MpegLayer2));
+    }
+
+    #[test]
+    fn primary_audio_component_supersedes_secondary() {
+        let mut decoder = EnsembleInfo::new();
+        // Secondary MP2 followed by primary DAB+.
+        decoder.parse_fig0_ext2(&[0x12, 0x34, 2, 0, 1 << 2, 63, (2 << 2) | 2], 0);
+        let service = decoder.services.get(&0x1234).unwrap();
+        assert_eq!(service.subchannel_id, Some(2));
+        assert_eq!(service.audio_coding, Some(AudioCoding::DabPlus));
     }
 }

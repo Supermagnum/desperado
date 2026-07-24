@@ -15,7 +15,7 @@
 //! Reference: ETSI EN 300 401 §11, §12, welle.io src/backend/msc-handler.cpp
 
 use crate::constants;
-use crate::fec::{eep, energy_dispersal, viterbi};
+use crate::fec::{eep, energy_dispersal, uep, viterbi};
 use crate::fic::fib::SubchannelInfo;
 use tracing::debug;
 
@@ -36,6 +36,12 @@ const DEINTERLEAVE_DEPTH: usize = 16;
 /// Reference: ETSI EN 300 401 §12, welle.io src/backend/msc-handler.cpp
 const DEINTERLEAVE_MAP: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
+#[derive(Debug, Clone, Copy)]
+enum ProtectionParams {
+    Eep(eep::EepParams),
+    Uep(uep::UepProfile),
+}
+
 /// MSC handler for a single subchannel.
 ///
 /// Accumulates OFDM symbols into CIFs, extracts the target subchannel,
@@ -44,8 +50,8 @@ pub struct MscHandler {
     /// Subchannel parameters.
     subch: SubchannelInfo,
 
-    /// EEP depuncturing parameters.
-    eep_params: eep::EepParams,
+    /// Protection-specific depuncturing parameters.
+    protection: ProtectionParams,
 
     /// Current CIF accumulation buffer: soft bits for one CIF.
     cif_buf: Vec<i8>,
@@ -76,34 +82,39 @@ pub struct MscHandler {
 impl MscHandler {
     /// Create a new MSC handler for the given subchannel.
     ///
-    /// Returns None if EEP parameters cannot be determined.
+    /// Returns None if protection parameters cannot be determined or do not
+    /// match the signalled subchannel size.
     pub fn new(subch: &SubchannelInfo) -> Option<Self> {
-        if !subch.is_eep {
-            debug!("UEP subchannels not yet supported");
-            return None;
-        }
-
-        let params = eep::eep_params(subch.bitrate, subch.protection_level, subch.eep_option)?;
-
-        // Verify that the punctured size matches the subchannel size
-        let expected_punctured = eep::msc_punctured_size(&params);
         let actual_size = subch.sub_size as usize * constants::CU_SIZE;
-        if expected_punctured != actual_size {
-            debug!(
-                "Punctured size mismatch: expected {} (from EEP params), got {} (from sub_size {}×{})",
-                expected_punctured,
-                actual_size,
-                subch.sub_size,
-                constants::CU_SIZE
-            );
-            return None;
-        }
+        let protection = if subch.is_eep {
+            let params = eep::eep_params(subch.bitrate, subch.protection_level, subch.eep_option)?;
+            let expected = eep::msc_punctured_size(&params);
+            if expected != actual_size {
+                debug!(expected, actual_size, "EEP punctured size mismatch");
+                return None;
+            }
+            ProtectionParams::Eep(params)
+        } else {
+            let profile = uep::profile(subch.bitrate, subch.protection_level)?;
+            let expected = uep::punctured_size(&profile);
+            // Some standardized UEP rows leave 4 or 8 padding bits in the
+            // capacity-unit allocation; the depuncturer consumes only profile
+            // bits and ignores that trailing padding.
+            if expected > actual_size || actual_size - expected > 8 {
+                debug!(
+                    expected,
+                    actual_size, "UEP punctured size mismatch beyond allowed padding"
+                );
+                return None;
+            }
+            ProtectionParams::Uep(profile)
+        };
 
-        let subch_size = subch.sub_size as usize * constants::CU_SIZE;
+        let subch_size = actual_size;
 
         Some(Self {
             subch: subch.clone(),
-            eep_params: params,
+            protection,
             cif_buf: vec![0i8; SOFT_BITS_PER_CIF],
             symbols_in_cif: 0,
             cif_in_frame: 0,
@@ -199,24 +210,31 @@ impl MscHandler {
             deinterleaved = deint;
         }
 
-        // FEC pipeline: depuncture → Viterbi → energy dispersal
-        let depunctured = eep::depuncture_msc(&deinterleaved, &self.eep_params);
+        // FEC pipeline: protection-specific depuncture → Viterbi → energy dispersal
+        let is_uep = matches!(self.protection, ProtectionParams::Uep(_));
+        let depunctured = match &self.protection {
+            ProtectionParams::Eep(params) => eep::depuncture_msc(&deinterleaved, params),
+            ProtectionParams::Uep(profile) => uep::depuncture(&deinterleaved, profile),
+        };
 
-        let (decoded_bits, metric) = viterbi::viterbi_decode_with_metric(&depunctured);
+        // The six termination bits force the legacy UEP convolutional code to
+        // state zero; an unrestricted best-state traceback can select an
+        // unrelated path on noisy frames.
+        let (decoded_bits, metric) = if is_uep {
+            viterbi::viterbi_decode_state0(&depunctured)
+        } else {
+            viterbi::viterbi_decode_with_metric(&depunctured)
+        };
 
         // Log Viterbi metric for signal quality monitoring
         if self.frames_decoded < 3 {
             let achievable: i32 = depunctured.iter().map(|&x| (x as i32).abs()).sum();
-            debug!(
-                metric = metric,
-                achievable = achievable,
-                pct = if achievable > 0 {
-                    metric as f64 / achievable as f64 * 100.0
-                } else {
-                    0.0
-                },
-                "MSC Viterbi metric"
-            );
+            let pct = if achievable > 0 {
+                metric as f64 / achievable as f64 * 100.0
+            } else {
+                0.0
+            };
+            debug!(is_uep, metric, achievable, pct, "MSC Viterbi metric");
         }
 
         // Truncate to 24 * bitrate bits, discarding the 6 tail bits.
@@ -278,7 +296,24 @@ impl MscHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::MscHandler;
     use crate::fec::{eep, energy_dispersal, viterbi};
+    use crate::fic::fib::SubchannelInfo;
+
+    #[test]
+    fn accepts_bbc_table_index_35_uep_subchannel() {
+        let subchannel = SubchannelInfo {
+            id: 1,
+            start_addr: 0,
+            sub_size: 96,
+            protection_level: 3,
+            is_eep: false,
+            eep_option: 0,
+            uep_table_index: Some(35),
+            bitrate: 128,
+        };
+        assert!(MscHandler::new(&subchannel).is_some());
+    }
 
     /// Test: feed welle.io's de-interleaved subchannel dump through our FEC pipeline.
     ///

@@ -10,6 +10,8 @@
 //!
 //! Reference: ETSI TS 102 563 (DAB+ audio), welle.io src/backend/dabplus_decoder.cpp
 
+pub mod mp2;
+
 use reed_solomon::Decoder as RsDecoder;
 use tracing::{debug, info, warn};
 
