@@ -41,7 +41,7 @@ impl Mp2DecodeOutput {
         }
 
         let mut upsampled = Vec::with_capacity(stereo.len() * 2);
-        for frame in stereo.chunks_exact(2) {
+        for frame in stereo.as_chunks::<2>().0 {
             upsampled.extend_from_slice(frame);
             upsampled.extend_from_slice(frame);
         }
