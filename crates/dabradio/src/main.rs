@@ -707,6 +707,25 @@ struct Cli {
     /// Enable debug logs for audio pipeline queue/underrun tracking
     #[arg(long, default_value_t = false)]
     debug_audio: bool,
+
+    /// Decode TPEG/TEC from packet-mode components and emit GeoJSON
+    #[arg(long, default_value_t = false)]
+    traffic: bool,
+
+    /// Dump parsed FIG 0/0–0/3, 0/8, 0/13 as JSON after processing
+    /// the full input (or --max-frames). Accumulates FIGs across the whole run
+    /// so late FIG 0/13 is not missed.
+    #[arg(long, default_value_t = false)]
+    dump_fic: bool,
+
+    /// Decode all packet-mode subchannels and print MSC packet CRC stats
+    /// (validates the packet-mode chain even when FIG 0/13 is not TPEG)
+    #[arg(long, default_value_t = false)]
+    dump_packets: bool,
+
+    /// Optional TMC/GLR location-table CSV or directory (points.csv)
+    #[arg(long)]
+    location_tables: Option<String>,
 }
 
 #[tokio::main]
@@ -918,6 +937,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keyboard_available = std::io::stdin().is_terminal();
     let inline_image_support = terminal_supports_inline_images();
     let term_image_support = inline_image_support && !tui_enabled;
+
+    let location_table = cli.location_tables.as_ref().and_then(|p| {
+        match traffic::LocationTable::load(std::path::Path::new(p)) {
+            Ok(t) => {
+                info!(entries = t.len(), path = %p, "Loaded location table");
+                Some(t)
+            }
+            Err(e) => {
+                warn!(path = %p, error = %e, "Failed to load location table");
+                None
+            }
+        }
+    });
+    let mut traffic_channels: Vec<TrafficChannel> = Vec::new();
+    let mut traffic_initialized = false;
+    let mut traffic_features: Vec<traffic::TrafficFeature> = Vec::new();
+    let mut packet_crc_warned = false;
 
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_state = Arc::new(Mutex::new(TuiState {
@@ -1378,6 +1414,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
+            // --dump-fic waits until EOF / --max-frames so FIG 0/13 from the
+            // full FIC repetition cycle is accumulated before printing.
+            if (cli.traffic || cli.dump_packets)
+                && !traffic_initialized
+                && (ensemble.is_complete() || frame_count >= 50)
+            {
+                ensemble.resolve_services();
+                traffic_channels = init_traffic_channels(
+                    &ensemble,
+                    &mut traffic_features,
+                    cli.dump_packets,
+                    cli.traffic,
+                );
+                traffic_initialized = true;
+                if cli.traffic
+                    && ensemble.tpeg_targets().is_empty()
+                    && traffic_features.is_empty()
+                {
+                    warn!(
+                        "No TPEG (UAtype 0x004) packet-mode component found in FIC; \
+                         FIG 0/13 did not confirm the TPEG hypothesis"
+                    );
+                    if is_file_source && !cli.dump_packets {
+                        emit_traffic_output(&traffic_features, cli.json);
+                        return Ok(());
+                    }
+                }
+            }
+
             // Try to initialize MSC handler if we have service info but no handler yet
             if decoding_service && msc_handler.is_none() && ensemble.has_services() {
                 ensemble.resolve_services();
@@ -1431,6 +1496,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     && let Err(e) = source.set_gain(Gain::Manual(db))
                 {
                     warn!(gain = db, error = %e, "Failed to set gain");
+                }
+            }
+
+            // Feed MSC symbols to packet-mode traffic decoders
+            if !traffic_channels.is_empty() {
+                let msc_start = constants::FIC_SYMBOLS;
+                let msc_end = soft_bits.len().min(75);
+                for ch in &mut traffic_channels {
+                    for sym in &soft_bits[msc_start..msc_end] {
+                        if let Some(decoded) = ch.msc.feed_symbol(sym) {
+                            for (assembler, target) in &mut ch.assemblers {
+                                for group in assembler.feed_bytes(&decoded) {
+                                    let payload = group.application_payload();
+                                    debug!(
+                                        address = group.address,
+                                        bytes = payload.len(),
+                                        "MSC data group"
+                                    );
+                                    if !cli.traffic || !target.is_tpeg() {
+                                        continue;
+                                    }
+                                    let sid = format_service_id(target.service_id);
+                                    let events = traffic::decode_payload(
+                                        payload,
+                                        location_table.as_ref(),
+                                        Some(&sid),
+                                    );
+                                    for event in events {
+                                        if cli.json {
+                                            println!("{}", event.to_json());
+                                        }
+                                        traffic_features.push(event);
+                                    }
+                                }
+                                if !packet_crc_warned && assembler.stats.is_chance_level() {
+                                    packet_crc_warned = true;
+                                    warn!(
+                                        packets = assembler.stats.packets_seen,
+                                        crc_ok = assembler.stats.crc_ok,
+                                        pass_rate = format!("{:.4}%", assembler.stats.crc_pass_rate() * 100.0),
+                                        "Packet CRC pass rate is chance-level; MSC/packet decode is not validated"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1721,6 +1832,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     audio_measure_active.store(false, Ordering::Relaxed);
 
+    if cli.dump_fic {
+        ensemble.resolve_services();
+        print_fic_dump(&ensemble, frame_count, fib_count);
+        if !cli.traffic && !cli.dump_packets {
+            return Ok(());
+        }
+    }
+
+
+    if cli.traffic || cli.dump_packets {
+        let mut stats_rows = Vec::new();
+        for ch in &traffic_channels {
+            for (assembler, target) in &ch.assemblers {
+                info!(
+                    service = %format_service_id(target.service_id),
+                    address = target.packet_address,
+                    packets = assembler.stats.packets_seen,
+                    crc_ok = assembler.stats.crc_ok,
+                    groups = assembler.stats.groups_complete,
+                    pass_rate = format!("{:.2}%", assembler.stats.crc_pass_rate() * 100.0),
+                    "packet-mode stats"
+                );
+                stats_rows.push(serde_json::json!({
+                    "service_id": format_service_id(target.service_id),
+                    "label": target.label,
+                    "subchannel_id": target.subchannel.id,
+                    "start_addr": target.subchannel.start_addr,
+                    "packet_address": target.packet_address,
+                    "dscty": target.dscty,
+                    "ua_types": target.ua_types.iter().map(|t| format!("0x{t:03X}")).collect::<Vec<_>>(),
+                    "is_tpeg": target.is_tpeg(),
+                    "packets_seen": assembler.stats.packets_seen,
+                    "crc_ok": assembler.stats.crc_ok,
+                    "crc_fail": assembler.stats.crc_fail,
+                    "address_mismatch": assembler.stats.address_mismatch,
+                    "groups_complete": assembler.stats.groups_complete,
+                    "pass_rate": assembler.stats.crc_pass_rate(),
+                    "chance_level": assembler.stats.is_chance_level(),
+                }));
+            }
+        }
+        if cli.dump_packets {
+            println!("{}", serde_json::to_string_pretty(&stats_rows).unwrap_or_default());
+        }
+        if cli.traffic && (!cli.json || traffic_features.is_empty()) {
+            emit_traffic_output(&traffic_features, true);
+        }
+    }
+
     // Drop the audio device with a timeout. tinyaudio's ALSA backend calls
     // thread::join() inside Drop, which hangs if snd_pcm_writei is blocked.
     // If the drop doesn't complete in 2 seconds, force-exit to avoid
@@ -1818,7 +1978,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!(path = %path, "Wrote decoded WAV audio");
             }
         }
-    } else {
+    } else if !cli.traffic && !cli.dump_packets {
         // Just print service listing
         let output = ensemble.to_output();
 
@@ -2094,6 +2254,185 @@ fn show_image_in_terminal(
     Ok(())
 }
 
+fn format_service_id(sid: u32) -> String {
+    if sid > 0xFFFF {
+        format!("0x{sid:08X}")
+    } else {
+        format!("0x{sid:04X}")
+    }
+}
+
+struct TrafficChannel {
+    msc: msc::MscHandler,
+    assemblers: Vec<(msc::packet::PacketAssembler, fic::fib::TpegTarget)>,
+}
+
+fn init_traffic_channels(
+    ensemble: &fic::fib::EnsembleInfo,
+    features: &mut Vec<traffic::TrafficFeature>,
+    dump_packets: bool,
+    decode_tpeg: bool,
+) -> Vec<TrafficChannel> {
+    let targets = if dump_packets {
+        ensemble.packet_mode_targets()
+    } else {
+        ensemble.tpeg_targets()
+    };
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let mut by_subch: std::collections::HashMap<u8, Vec<fic::fib::TpegTarget>> =
+        std::collections::HashMap::new();
+    for target in targets {
+        if decode_tpeg && target.is_tpeg() && (target.ca_flag || target.ca_org.is_some()) {
+            let mut props = traffic::TrafficProperties::for_bearer(traffic::Bearer::DabTpeg);
+            props.unsupported_ca = Some(true);
+            props.encrypted = Some(true);
+            props.service_id = Some(format_service_id(target.service_id));
+            props.description = Some(
+                "Packet-mode component is CA-flagged; descrambling is not supported".into(),
+            );
+            features.push(traffic::TrafficFeature::new(props, None));
+            info!(
+                service = %format_service_id(target.service_id),
+                "Skipping CA-protected TPEG component"
+            );
+            continue;
+        }
+        if target.is_tpeg() {
+            info!(
+                service = %format_service_id(target.service_id),
+                label = target.label.as_deref().unwrap_or("(unlabelled)"),
+                subchannel = target.subchannel.id,
+                address = target.packet_address,
+                bitrate = target.subchannel.bitrate,
+                dscty = ?target.dscty,
+                no_data_groups = target.no_data_groups,
+                "TPEG component confirmed (UAtype 0x004)"
+            );
+        } else if dump_packets {
+            info!(
+                service = %format_service_id(target.service_id),
+                label = target.label.as_deref().unwrap_or("(unlabelled)"),
+                subchannel = target.subchannel.id,
+                start_addr = target.subchannel.start_addr,
+                address = target.packet_address,
+                ua_types = ?target.ua_types,
+                "Packet-mode component (not TPEG)"
+            );
+        }
+        by_subch
+            .entry(target.subchannel.id)
+            .or_default()
+            .push(target);
+    }
+    let mut channels = Vec::new();
+    for (_, group) in by_subch {
+        let Some(first) = group.first() else {
+            continue;
+        };
+        let Some(msc) = msc::MscHandler::new(&first.subchannel) else {
+            warn!(
+                subchannel = first.subchannel.id,
+                "Failed to initialize packet-mode MSC handler"
+            );
+            continue;
+        };
+        let assemblers = group
+            .into_iter()
+            .map(|t| {
+                let addr = t.packet_address;
+                (msc::packet::PacketAssembler::new(addr), t)
+            })
+            .collect();
+        channels.push(TrafficChannel { msc, assemblers });
+    }
+    channels
+}
+
+fn print_fic_dump(ensemble: &fic::fib::EnsembleInfo, frame_count: usize, fib_count: usize) {
+    let output = ensemble.to_output();
+    let mut fig013_flat: Vec<serde_json::Value> = Vec::new();
+    for ((sid, scids), apps) in &ensemble.user_applications {
+        for ua in apps {
+            fig013_flat.push(serde_json::json!({
+                "sid": format_service_id(*sid),
+                "scids": scids,
+                "ua_type": format!("0x{:03X}", ua.ua_type),
+                "ua_type_dec": ua.ua_type,
+                "name": ua.name(),
+                "data": ua.data,
+            }));
+        }
+    }
+    fig013_flat.sort_by(|a, b| {
+        let sa = a["sid"].as_str().unwrap_or("");
+        let sb = b["sid"].as_str().unwrap_or("");
+        sa.cmp(sb)
+            .then_with(|| {
+                a["scids"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .cmp(&b["scids"].as_u64().unwrap_or(0))
+            })
+            .then_with(|| {
+                a["ua_type"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["ua_type"].as_str().unwrap_or(""))
+            })
+    });
+    let tpeg_hits: Vec<_> = fig013_flat
+        .iter()
+        .filter(|e| e["ua_type_dec"].as_u64() == Some(0x004))
+        .cloned()
+        .collect();
+    let dump = serde_json::json!({
+        "ensemble_id": ensemble.ensemble_id,
+        "ensemble_id_hex": ensemble.ensemble_id.map(|e| format!("0x{e:04X}")),
+        "ensemble_label": ensemble.ensemble_label,
+        "ofdm_frames": frame_count,
+        "fibs_decoded": fib_count,
+        "subchannels": ensemble.subchannels,
+        "packet_components": ensemble.packet_components,
+        "scids_bindings": ensemble.scids_bindings.iter().map(|((sid, scids), b)| {
+            serde_json::json!({
+                "sid": format_service_id(*sid),
+                "scids": scids,
+                "binding": b,
+            })
+        }).collect::<Vec<_>>(),
+        "fig_0_13_flat": fig013_flat,
+        "tpeg_ua_type_0x004": tpeg_hits,
+        "user_applications": ensemble.user_applications.iter().map(|((sid, scids), apps)| {
+            serde_json::json!({
+                "sid": format_service_id(*sid),
+                "scids": scids,
+                "apps": apps.iter().map(|ua| serde_json::json!({
+                    "ua_type": format!("0x{:03X}", ua.ua_type),
+                    "name": ua.name(),
+                    "data": ua.data,
+                })).collect::<Vec<_>>(),
+            })
+        }).collect::<Vec<_>>(),
+        "services": output.services,
+    });
+    println!("{}", serde_json::to_string_pretty(&dump).unwrap_or_default());
+}
+
+fn emit_traffic_output(features: &[traffic::TrafficFeature], as_collection: bool) {
+    if as_collection {
+        println!(
+            "{}",
+            traffic::FeatureCollection::new(features.to_vec()).to_json()
+        );
+    } else {
+        for f in features {
+            println!("{}", f.to_json());
+        }
+    }
+}
+
 /// Try to find the requested service and initialize an MSC handler for it.
 /// Returns the handler and the service bitrate.
 fn try_init_msc(
@@ -2245,6 +2584,19 @@ fn print_services(ensemble: &fic::fib::EnsembleInfo, json: bool) {
                 .unwrap_or_default(),
             svc.protection.as_deref().unwrap_or(""),
         );
+        for c in &svc.components {
+            if c.tmid == 3 {
+                let apps = if c.user_applications.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", c.user_applications.join(", "))
+                };
+                println!(
+                    "         packet SCId={:?} addr={:?} subch={:?} CA={}{}",
+                    c.scid, c.packet_address, c.subchannel_id, c.ca, apps
+                );
+            }
+        }
     }
 }
 

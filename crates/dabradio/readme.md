@@ -14,6 +14,7 @@ A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting
   - **DLS (Dynamic Label Segment)**: Song titles, artist names, and text metadata
   - **MOT (Multimedia Object Transfer)**: Album art and slideshow images (JPEG/PNG)
 - **JSON output** — Service listings as JSON for programmatic access
+- **Packet-mode data** — FIG 0/3, 0/8, 0/13; MSC packet reassembly; TPEG/TEC GeoJSON when UAtype 0x004 is signalled
 - **Multiple input formats** — cu8, cs8, cs16, cf32 IQ samples from files or network streams
 - **Real-time audio playback** — Streams decoded audio directly to soundcard via tinyaudio
 - **Cross-platform** — Tested on Linux x86_64 and macOS Apple Silicon
@@ -166,63 +167,42 @@ OPTIONS:
     --bypass-deinterleave
             Debug: skip time de-interleaving in MSC (testing only)
 
+    --dump-fic
+            Dump parsed FIG 0/0–0/3, 0/8, 0/13 as JSON after the full input
+            (accumulates across the whole run; use without --max-frames for a
+            complete FIG 0/13 sweep)
+
+    --dump-packets
+            Decode packet-mode MSC subchannels and print CRC stats as JSON
+
+    --traffic
+            Decode TPEG/TEC (FIG 0/13 UAtype 0x004) and emit GeoJSON
+
+    --location-tables <PATH>
+            Optional TMC/GLR location table (CSV or directory with points.csv)
+
     -h, --help
             Print help information
 ```
 
-## Architecture
+### Packet-mode data and TPEG/TEC
 
-### OFDM Processing (`ofdm/processor.rs`)
-
-The OFDM processor implements DAB's frame synchronization pipeline:
-
-1. **Null symbol detection** — finds power drops in the IQ stream
-2. **PRS correlation** — IFFT-based timing via Phase Reference Symbol
-3. **Frequency estimation** — cyclic prefix and coarse frequency correction
-4. **Symbol extraction** — FFT of 76 OFDM symbols (1 PRS + 75 data)
-
-**Robustness feature**: When PRS correlation SNR drops below 5.0 (indicating alignment drift), the processor automatically re-detects the null symbol and re-synchronizes. This handles files with dropped samples (e.g., gqrx cf32 recordings with capture interrupts).
-
-### FIC Handler (`fic/handler.rs`, `fic/fib.rs`)
-
-Decodes the Fast Information Channel (FIC):
-
-- **FIC symbols 0-2** → depuncture, Viterbi decode, energy dispersal → FIBs (Fast Information Blocks)
-- **FIB parsing** → FIG (Fast Information Group) processing
-- **Ensemble & service discovery** → service labels, subchannel config, bitrates, protection levels
-
-Waits for complete FIC data (all services with labels, all subchannels) before declaring sync complete.
-
-### MSC Handler (`msc/mod.rs`)
-
-Decodes the Main Service Channel (MSC):
-
-- **CIF assembly** — buffers OFDM symbols into Common Interleaved Frames
-- **Time de-interleaving** — reverses the time-domain interleave applied by transmitter
-- **Subchannel extraction** — isolates the target service's data
-- **FEC decoding** — depuncturing (UEP or EEP), Viterbi, energy dispersal
-
-Supports both UEP (Unequal Error Protection) and EEP (Equal Error Protection) schemes.
-
-### DAB+ Audio Decoder (`audio/mod.rs`)
-
-Decodes DAB+ superframes to PCM audio:
-
-1. **Superframe sync** — finds fire code in logical frames
-2. **Reed-Solomon correction** — RS(120,110) error correction
-3. **AU extraction** — parses Access Units with CRC validation
-4. **AAC decoding** — fdk-aac library handles AudioSpecificConfig and decoding
-5. **Audio output** — sends 48 kHz stereo PCM to tinyaudio for playback
-
-## Performance
-
-- **Real-time decode** — typical 5-10x realtime on modern CPUs
-- **Memory-efficient** — circular buffers and lazy allocation
-- **Low-latency audio** — 4-second crossbeam buffer for smooth playback
-
-## Testing
+FIG 0/3, FIG 0/8, and FIG 0/13 are parsed so packet-mode components can be
+resolved to a SubChId and packet address. TPEG is only treated as confirmed
+when FIG 0/13 signals user-application type `0x004`. Conditional-access
+components are reported and skipped; they are not descrambled.
 
 ```bash
+# Inspect FIC (ensemble, packet components, user applications)
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-fic --max-frames 80
+
+# Validate packet-mode MSC (CRC pass rate; chance-level means decode is wrong)
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-packets --max-frames 200
+
+# TPEG/TEC GeoJSON when a TPEG component is present
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --traffic
+
+
 # Run all tests
 cargo test -p dabradio
 

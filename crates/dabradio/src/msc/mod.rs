@@ -19,6 +19,8 @@ use crate::fec::{eep, energy_dispersal, uep, viterbi};
 use crate::fic::fib::SubchannelInfo;
 use tracing::debug;
 
+pub mod packet;
+
 /// Number of MSC OFDM symbols per CIF.
 const MSC_SYMBOLS_PER_CIF: usize = 18;
 
