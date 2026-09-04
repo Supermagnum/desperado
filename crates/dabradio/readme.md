@@ -195,11 +195,17 @@ resolved to a SubChId and packet address. TPEG is only treated as confirmed
 when FIG 0/13 signals user-application type `0x004`. Conditional-access
 components are reported and skipped; they are not descrambled.
 
+A short NRK Riks (channel 12D) cf32 clip is checked in under
+`crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq` (~1.25 s at 2.048 MS/s)
+for FIC lock and FIG dumps without a multi-GB capture.
+
 ```bash
 # Inspect FIC (ensemble, packet components, user applications)
-./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-fic --max-frames 80
+./target/release/dabradio crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq \
+  --channel 12D --format cf32 --dump-fic --max-frames 40
 
 # Validate packet-mode MSC (CRC pass rate; chance-level means decode is wrong)
+# Needs a longer capture than the short fixture; use your own IQ file:
 ./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-packets --max-frames 200
 
 # TPEG/TEC GeoJSON when a TPEG component is present
@@ -209,7 +215,8 @@ components are reported and skipped; they are not descrambled.
 
 NRK-style traffic announcements are audio-side stream switching, not packet-mode
 TPEG. `--announcements` emits `AnnouncementEvent` JSON lines
-(`bearer: dab-announcement`) when FIG 0/19 indicates an active cluster:
+(`bearer: dab-announcement`) when FIG 0/19 indicates an active cluster.
+Use a longer Innland/13E capture when available:
 
 ```bash
 ./target/release/dabradio recording.cf32.iq --channel 13E --format cf32 \

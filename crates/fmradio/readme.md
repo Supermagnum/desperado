@@ -138,7 +138,10 @@ Example output:
 
 ### RDS-TMC traffic GeoJSON
 
-Norway has no FM network to test against. Use a live or recorded FM signal from a country that still carries unencrypted RDS-TMC, or a synthetic group vector.
+Unencrypted RDS-TMC (ALERT-C) is still carried on many European FM networks
+(for example Germany and France). Decode from a live tuner or an IQ capture of
+such a station; unit tests in `crates/fmradio` and `crates/traffic` also cover
+ALERT-C parsing without RF.
 
 ```bash
 cargo run --release -p fmradio -- capture.cf32 --freq 96.9M --format cf32 --no-audio --traffic
