@@ -962,8 +962,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut announcement_monitor = fic::fib::AnnouncementMonitor::new();
     let mut announcement_events: Vec<traffic::AnnouncementEvent> = Vec::new();
     // All FIG 0/19 entries observed during the run (for --dump-fic).
-    let mut announcement_switching_seen: std::collections::HashMap<u8, fic::fib::AnnouncementSwitch> =
-        std::collections::HashMap::new();
+    let mut announcement_switching_seen: std::collections::HashMap<
+        u8,
+        fic::fib::AnnouncementSwitch,
+    > = std::collections::HashMap::new();
 
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_state = Arc::new(Mutex::new(TuiState {
@@ -1482,9 +1484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cli.traffic,
                 );
                 traffic_initialized = true;
-                if cli.traffic
-                    && ensemble.tpeg_targets().is_empty()
-                    && traffic_features.is_empty()
+                if cli.traffic && ensemble.tpeg_targets().is_empty() && traffic_features.is_empty()
                 {
                     warn!(
                         "No TPEG (UAtype 0x004) packet-mode component found in FIC; \
@@ -1589,7 +1589,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     warn!(
                                         packets = assembler.stats.packets_seen,
                                         crc_ok = assembler.stats.crc_ok,
-                                        pass_rate = format!("{:.4}%", assembler.stats.crc_pass_rate() * 100.0),
+                                        pass_rate = format!(
+                                            "{:.4}%",
+                                            assembler.stats.crc_pass_rate() * 100.0
+                                        ),
                                         "Packet CRC pass rate is chance-level; MSC/packet decode is not validated"
                                     );
                                 }
@@ -1952,7 +1955,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if cli.dump_packets {
-            println!("{}", serde_json::to_string_pretty(&stats_rows).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&stats_rows).unwrap_or_default()
+            );
         }
         if cli.traffic && (!cli.json || traffic_features.is_empty()) {
             emit_traffic_output(&traffic_features, true);
@@ -2367,9 +2373,8 @@ fn init_traffic_channels(
             props.unsupported_ca = Some(true);
             props.encrypted = Some(true);
             props.service_id = Some(format_service_id(target.service_id));
-            props.description = Some(
-                "Packet-mode component is CA-flagged; descrambling is not supported".into(),
-            );
+            props.description =
+                Some("Packet-mode component is CA-flagged; descrambling is not supported".into());
             features.push(traffic::TrafficFeature::new(props, None));
             info!(
                 service = %format_service_id(target.service_id),
@@ -2518,7 +2523,10 @@ fn print_fic_dump(ensemble: &fic::fib::EnsembleInfo, frame_count: usize, fib_cou
         }).collect::<Vec<_>>(),
         "services": output.services,
     });
-    println!("{}", serde_json::to_string_pretty(&dump).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&dump).unwrap_or_default()
+    );
 }
 
 fn emit_traffic_output(features: &[traffic::TrafficFeature], as_collection: bool) {

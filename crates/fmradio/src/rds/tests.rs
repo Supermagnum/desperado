@@ -605,10 +605,7 @@ fn group_8a_decodes_alert_c_after_3a() {
     // 8A single-group: T=0 F=1 duration=1, event 101, location 0x1234
     let block2_8a = (8u16 << 12) | 0x08 | 0x01;
     let y = 101u16; // no diversion, +, extent 0
-    parser.handle_group(
-        [0xF201, block2_8a, y, 0x1234],
-        [true, true, true, true],
-    );
+    parser.handle_group([0xF201, block2_8a, y, 0x1234], [true, true, true, true]);
     let features = parser.take_traffic_features();
     assert_eq!(features.len(), 1);
     assert_eq!(features[0].properties.event_code, Some(101));
@@ -629,11 +626,12 @@ fn encrypted_tmc_is_not_decoded() {
     assert_eq!(notice[0].properties.encrypted, Some(true));
 
     let block2_8a = (8u16 << 12) | 0x08;
-    parser.handle_group(
-        [0xF201, block2_8a, 101, 0x1234],
-        [true, true, true, true],
-    );
+    parser.handle_group([0xF201, block2_8a, 101, 0x1234], [true, true, true, true]);
     let features = parser.take_traffic_features();
     assert!(features.iter().all(|f| f.properties.event_code.is_none()));
-    assert!(features.iter().all(|f| f.properties.encrypted == Some(true)));
+    assert!(
+        features
+            .iter()
+            .all(|f| f.properties.encrypted == Some(true))
+    );
 }

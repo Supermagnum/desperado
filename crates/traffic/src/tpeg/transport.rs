@@ -46,10 +46,7 @@ pub fn find_frames(data: &[u8]) -> Vec<TransportFrame> {
                 continue;
             }
             let payload = data[i + 6..frame_end - 2].to_vec();
-            frames.push(TransportFrame {
-                payload,
-                offset: i,
-            });
+            frames.push(TransportFrame { payload, offset: i });
             i = frame_end;
             continue;
         }

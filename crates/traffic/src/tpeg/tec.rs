@@ -56,10 +56,7 @@ pub fn decode_frame(
         let mut features = Vec::new();
         for comp in &svc.components {
             features.extend(decode_application_data(
-                &comp.data,
-                svc.sid,
-                locations,
-                service_id,
+                &comp.data, svc.sid, locations, service_id,
             ));
         }
         if !features.is_empty() {
@@ -76,7 +73,8 @@ fn ca_unsupported_feature(sid: u32, service_id: Option<&str>) -> TrafficFeature 
     props.encrypted = Some(true);
     props.tpeg_sid = Some(format!("0x{sid:06X}"));
     props.service_id = service_id.map(str::to_string);
-    props.description = Some("TPEG component is CA-protected; descrambling is not supported".into());
+    props.description =
+        Some("TPEG component is CA-protected; descrambling is not supported".into());
     TrafficFeature::new(props, None)
 }
 
@@ -126,9 +124,7 @@ fn feature_from_group(
     locations: Option<&LocationTable>,
     service_id: Option<&str>,
 ) -> Option<TrafficFeature> {
-    let tec = nodes
-        .iter()
-        .find(|n| n.id == COMP_TEC || n.id == TEC_AID)?;
+    let tec = nodes.iter().find(|n| n.id == COMP_TEC || n.id == TEC_AID)?;
     let lrc = nodes.iter().find(|n| n.id == COMP_LRC);
 
     let mut props = TrafficProperties::for_bearer(Bearer::DabTpeg);
@@ -158,7 +154,9 @@ fn feature_from_group(
     Some(TrafficFeature::new(props, geometry))
 }
 
-fn parse_tec_fields(tec: &Tpeg2Component) -> Option<(Option<u64>, Option<u64>, Option<serde_json::Value>)> {
+fn parse_tec_fields(
+    tec: &Tpeg2Component,
+) -> Option<(Option<u64>, Option<u64>, Option<serde_json::Value>)> {
     // Compact encoding: first IntUnLoMB is effectCode, optional second is causeCode.
     // Nested children override the compact form.
     let mut effect = None;
@@ -200,10 +198,7 @@ fn parse_lrc_fields(lrc: &Tpeg2Component) -> Option<LrcFields> {
     let data = if lrc.children.is_empty() {
         &lrc.data
     } else {
-        lrc.children
-            .first()
-            .map(|c| &c.data)
-            .unwrap_or(&lrc.data)
+        lrc.children.first().map(|c| &c.data).unwrap_or(&lrc.data)
     };
     if data.len() < 2 {
         return None;

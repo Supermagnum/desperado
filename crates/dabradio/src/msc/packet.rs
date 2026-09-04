@@ -236,7 +236,9 @@ pub fn encode_packet(
 ) -> Vec<u8> {
     let packet_len = PACKET_LENGTHS[length_id as usize];
     let mut pkt = vec![0u8; packet_len];
-    pkt[0] = (length_id << 6) | ((continuity & 0x03) << 4) | ((first_last & 0x03) << 2)
+    pkt[0] = (length_id << 6)
+        | ((continuity & 0x03) << 4)
+        | ((first_last & 0x03) << 2)
         | ((address >> 8) as u8 & 0x03);
     pkt[1] = (address & 0xFF) as u8;
     pkt[2] = payload.len() as u8 & 0x7F;

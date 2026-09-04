@@ -293,14 +293,7 @@ impl TmcDecoder {
             f.extent as i8
         };
         props.extent = Some(signed_extent);
-        props.direction = Some(
-            if f.negative {
-                "negative"
-            } else {
-                "positive"
-            }
-            .to_string(),
-        );
+        props.direction = Some(if f.negative { "negative" } else { "positive" }.to_string());
         props.diversion_advised = Some(f.diversion);
         props.duration = f.duration;
         if !f.extra.is_empty() {
@@ -383,9 +376,7 @@ mod tests {
     fn encrypted_user_group_is_not_decoded() {
         let mut dec = TmcDecoder::new();
         dec.handle_system_group(0); // LTN=0
-        let feature = dec
-            .handle_user_group(tmc_x_single(0), 101, 0x1234)
-            .unwrap();
+        let feature = dec.handle_user_group(tmc_x_single(0), 101, 0x1234).unwrap();
         assert_eq!(feature.properties.encrypted, Some(true));
         assert!(feature.properties.location_code.is_none());
         assert!(feature.properties.event_code.is_none());

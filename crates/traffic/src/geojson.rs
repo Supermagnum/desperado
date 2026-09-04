@@ -17,12 +17,8 @@ pub enum Bearer {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum Geometry {
-    Point {
-        coordinates: [f64; 2],
-    },
-    LineString {
-        coordinates: Vec<[f64; 2]>,
-    },
+    Point { coordinates: [f64; 2] },
+    LineString { coordinates: Vec<[f64; 2]> },
 }
 
 /// Traffic-event properties shared across bearers.
@@ -117,7 +113,8 @@ impl FeatureCollection {
     }
 
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{\"type\":\"FeatureCollection\",\"features\":[]}".to_string())
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| "{\"type\":\"FeatureCollection\",\"features\":[]}".to_string())
     }
 }
 

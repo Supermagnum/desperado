@@ -478,8 +478,7 @@ impl EnsembleInfo {
             let dg_flag = data[pos + 2] & 0x80 != 0;
             let dscty = data[pos + 2] & 0x3F;
             let subch_id = data[pos + 3] >> 2;
-            let packet_address =
-                (((data[pos + 3] as u16) & 0x03) << 8) | data[pos + 4] as u16;
+            let packet_address = (((data[pos + 3] as u16) & 0x03) << 8) | data[pos + 4] as u16;
 
             let ca_org = if ca_org_flag {
                 if pos + 7 > data.len() {
@@ -1367,9 +1366,22 @@ mod tests {
         let mut bytes = vec![0x01, 0x00, 0x02, 0xC0 | 50, 0x0A]; // region_id=10
         bytes.extend_from_slice(&[0x02, 0x00, 0x04, 40]); // cluster 2, transport, subch 40
         decoder.parse_fig0_ext19(&bytes);
-        assert_eq!(decoder.announcement_switching.get(&1).unwrap().region_id, Some(10));
-        assert_eq!(decoder.announcement_switching.get(&2).unwrap().subchannel_id, 40);
-        assert_eq!(decoder.announcement_switching.get(&2).unwrap().asw_flags, 0x0004);
+        assert_eq!(
+            decoder.announcement_switching.get(&1).unwrap().region_id,
+            Some(10)
+        );
+        assert_eq!(
+            decoder
+                .announcement_switching
+                .get(&2)
+                .unwrap()
+                .subchannel_id,
+            40
+        );
+        assert_eq!(
+            decoder.announcement_switching.get(&2).unwrap().asw_flags,
+            0x0004
+        );
     }
 
     #[test]
@@ -1422,9 +1434,7 @@ impl AnnouncementMonitor {
         timestamp_unix_ms: Option<u64>,
     ) -> Vec<traffic::AnnouncementEvent> {
         let mut events = Vec::new();
-        let eid = ensemble
-            .ensemble_id
-            .map(|e| format!("0x{e:04X}"));
+        let eid = ensemble.ensemble_id.map(|e| format!("0x{e:04X}"));
         for (cluster, sw) in &ensemble.announcement_switching {
             if sw.asw_flags == 0 {
                 continue;
@@ -1483,9 +1493,7 @@ impl AnnouncementMonitor {
         ensemble: &EnsembleInfo,
         timestamp_unix_ms: Option<u64>,
     ) -> Vec<traffic::AnnouncementEvent> {
-        let eid = ensemble
-            .ensemble_id
-            .map(|e| format!("0x{e:04X}"));
+        let eid = ensemble.ensemble_id.map(|e| format!("0x{e:04X}"));
         let mut ended = Vec::new();
         let still: std::collections::HashSet<u8> = ensemble
             .announcement_switching

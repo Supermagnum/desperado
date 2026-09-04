@@ -88,7 +88,10 @@ impl LocationTable {
                 Some(v) => v,
                 None => continue,
             };
-            let name = parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let name = parts
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
             table.insert(Location {
                 code,
                 lat,

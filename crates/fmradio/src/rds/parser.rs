@@ -15,8 +15,8 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::{self, Display};
 use tracing::{debug, trace};
-use traffic::tmc::{TmcDecoder, is_tmc_aid};
 use traffic::TrafficFeature;
+use traffic::tmc::{TmcDecoder, is_tmc_aid};
 
 use super::constants::*;
 
