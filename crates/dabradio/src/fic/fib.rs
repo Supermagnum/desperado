@@ -7,6 +7,8 @@
 //! - Packet-mode components (FIG 0/3): SCId → SubChId + packet address
 //! - Service-component global definition (FIG 0/8): SId+SCIdS → SubChId / SCId
 //! - User application information (FIG 0/13): UAtype (0x004 = TPEG)
+//! - Announcement support (FIG 0/18): ASu bitmap + cluster membership
+//! - Announcement switching (FIG 0/19): live cluster → SubChId trigger
 //! - Service labels (FIG 1/1, FIG 1/5): 16-char labels for audio and data services
 //! - Ensemble label (FIG 1/0 with OE=0, ext=0): ensemble name
 //!
@@ -29,6 +31,10 @@ pub struct EnsembleInfo {
     pub scids_bindings: HashMap<(u32, u8), ScidsBinding>,
     /// FIG 0/13 user applications keyed by (SId, SCIdS).
     pub user_applications: HashMap<(u32, u8), Vec<UserApplication>>,
+    /// FIG 0/18 announcement support keyed by SId.
+    pub announcement_support: HashMap<u32, AnnouncementSupport>,
+    /// Latest FIG 0/19 switching state keyed by Cluster Id.
+    pub announcement_switching: HashMap<u8, AnnouncementSwitch>,
 }
 
 /// Audio coding signalled by FIG 0/2 ASCTy.
@@ -131,7 +137,26 @@ impl UserApplication {
     }
 }
 
+/// FIG 0/18 announcement support for one service (EN 300 401 §8.1.6.1).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct AnnouncementSupport {
+    pub service_id: u32,
+    /// 16-bit ASu flags (Table 15): bit1 = Road Traffic, bit2 = Transport, …
+    pub asu_flags: u16,
+    pub cluster_ids: Vec<u8>,
+}
 
+/// FIG 0/19 announcement switching entry (EN 300 401 §8.1.6.2).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AnnouncementSwitch {
+    pub cluster_id: u8,
+    /// 16-bit ASw flags: currently active announcement types.
+    pub asw_flags: u16,
+    pub new_flag: bool,
+    pub region_flag: bool,
+    pub subchannel_id: u8,
+    pub region_id: Option<u8>,
+}
 
 /// Subchannel configuration.
 #[derive(Debug, Default, Clone, Serialize)]
@@ -257,6 +282,8 @@ impl EnsembleInfo {
             3 => self.parse_fig0_ext3(fig_data),
             8 => self.parse_fig0_ext8(fig_data, (data[0] >> 5) & 1),
             13 => self.parse_fig0_ext13(fig_data, (data[0] >> 5) & 1),
+            18 => self.parse_fig0_ext18(fig_data, (data[0] >> 5) & 1),
+            19 => self.parse_fig0_ext19(fig_data),
             _ => {}
         }
     }
@@ -577,6 +604,101 @@ impl EnsembleInfo {
         }
     }
 
+    /// FIG 0/18: Announcement support (ETSI EN 300 401 §8.1.6.1).
+    ///
+    /// Per service: SId (16/32 via P/D) + ASu flags (16) + Rfa (3) +
+    /// Number of Clusters (5) + that many Cluster Id bytes.
+    fn parse_fig0_ext18(&mut self, data: &[u8], pd: u8) {
+        let mut pos = 0;
+        while pos < data.len() {
+            let sid_len = if pd == 0 { 2 } else { 4 };
+            if pos + sid_len + 3 > data.len() {
+                break;
+            }
+            let sid = if pd == 0 {
+                ((data[pos] as u32) << 8) | data[pos + 1] as u32
+            } else {
+                ((data[pos] as u32) << 24)
+                    | ((data[pos + 1] as u32) << 16)
+                    | ((data[pos + 2] as u32) << 8)
+                    | data[pos + 3] as u32
+            };
+            pos += sid_len;
+            let asu_flags = ((data[pos] as u16) << 8) | data[pos + 1] as u16;
+            pos += 2;
+            // Rfa (3) | Number of Clusters (5) — matches EN 300 401 / welle.io.
+            let n_clusters = (data[pos] & 0x1F) as usize;
+            pos += 1;
+            if pos + n_clusters > data.len() {
+                break;
+            }
+            let mut cluster_ids = Vec::with_capacity(n_clusters);
+            for &cid in &data[pos..pos + n_clusters] {
+                if cid != 0 {
+                    cluster_ids.push(cid);
+                }
+            }
+            pos += n_clusters;
+            self.announcement_support.insert(
+                sid,
+                AnnouncementSupport {
+                    service_id: sid,
+                    asu_flags,
+                    cluster_ids,
+                },
+            );
+        }
+    }
+
+    /// FIG 0/19: Announcement switching (ETSI EN 300 401 §8.1.6.2).
+    ///
+    /// Cluster Id (8) + ASw flags (16) + New (1) + Region flag (1) +
+    /// SubChId (6), plus an optional RegionId byte when Region flag is set.
+    fn parse_fig0_ext19(&mut self, data: &[u8]) {
+        let mut pos = 0;
+        while pos + 4 <= data.len() {
+            let cluster_id = data[pos];
+            let asw_flags = ((data[pos + 1] as u16) << 8) | data[pos + 2] as u16;
+            let new_flag = data[pos + 3] & 0x80 != 0;
+            let region_flag = data[pos + 3] & 0x40 != 0;
+            let subchannel_id = data[pos + 3] & 0x3F;
+            pos += 4;
+            let region_id = if region_flag {
+                if pos >= data.len() {
+                    break;
+                }
+                // EN 300 401 / welle.io: Rfa(2) then RegionId(6) in the extension byte.
+                let rid = data[pos] & 0x3F;
+                pos += 1;
+                Some(rid)
+            } else {
+                None
+            };
+            self.announcement_switching.insert(
+                cluster_id,
+                AnnouncementSwitch {
+                    cluster_id,
+                    asw_flags,
+                    new_flag,
+                    region_flag,
+                    subchannel_id,
+                    region_id,
+                },
+            );
+        }
+    }
+
+    /// Services that FIG 0/18 lists as members of `cluster_id`.
+    pub fn services_in_announcement_cluster(&self, cluster_id: u8) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .announcement_support
+            .values()
+            .filter(|s| s.cluster_ids.contains(&cluster_id))
+            .map(|s| s.service_id)
+            .collect();
+        out.sort_unstable();
+        out
+    }
 
     /// Parse FIG type 1 (Labels).
     fn parse_fig_type1(&mut self, data: &[u8]) {
@@ -973,7 +1095,7 @@ fn eep_bitrate(sub_size: u16, option: u8, protection_level: u8) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AudioCoding, EnsembleInfo, ScidsBinding, SubchannelInfo,
+        AnnouncementMonitor, AudioCoding, EnsembleInfo, ScidsBinding, SubchannelInfo,
         UserApplication, decode_label, uep_table,
     };
     use crate::fec::uep::{profile, punctured_size};
@@ -1214,6 +1336,192 @@ mod tests {
         assert!(decoder.tpeg_targets().is_empty());
     }
 
+    #[test]
+    fn fig0_18_parses_asu_and_clusters() {
+        let mut decoder = EnsembleInfo::new();
+        // SId 0xF801, ASu = Road Traffic|Transport = 0x0006, 2 clusters: 1, 2
+        decoder.parse_fig0_ext18(&[0xF8, 0x01, 0x00, 0x06, 0x02, 0x01, 0x02], 0);
+        let s = decoder.announcement_support.get(&0xF801).unwrap();
+        assert_eq!(s.asu_flags, 0x0006);
+        assert_eq!(s.cluster_ids, vec![1, 2]);
+        assert!(traffic::is_traffic_relevant(s.asu_flags));
+    }
+
+    #[test]
+    fn fig0_19_parses_switch_without_region() {
+        let mut decoder = EnsembleInfo::new();
+        // Cluster 1, ASw Road Traffic 0x0002, New=1, Region=0, SubCh=50
+        decoder.parse_fig0_ext19(&[0x01, 0x00, 0x02, 0x80 | 50]);
+        let sw = decoder.announcement_switching.get(&1).unwrap();
+        assert_eq!(sw.asw_flags, 0x0002);
+        assert!(sw.new_flag);
+        assert!(!sw.region_flag);
+        assert_eq!(sw.subchannel_id, 50);
+        assert!(sw.region_id.is_none());
+    }
+
+    #[test]
+    fn fig0_19_with_region_advances_five_bytes() {
+        let mut decoder = EnsembleInfo::new();
+        // Two entries: first with region, second without — packing must not slip.
+        let mut bytes = vec![0x01, 0x00, 0x02, 0xC0 | 50, 0x0A]; // region_id=10
+        bytes.extend_from_slice(&[0x02, 0x00, 0x04, 40]); // cluster 2, transport, subch 40
+        decoder.parse_fig0_ext19(&bytes);
+        assert_eq!(decoder.announcement_switching.get(&1).unwrap().region_id, Some(10));
+        assert_eq!(decoder.announcement_switching.get(&2).unwrap().subchannel_id, 40);
+        assert_eq!(decoder.announcement_switching.get(&2).unwrap().asw_flags, 0x0004);
+    }
+
+    #[test]
+    fn announcement_monitor_emits_start_and_end() {
+        let mut enc = EnsembleInfo::new();
+        enc.parse_fig0_ext18(&[0xF8, 0x01, 0x00, 0x02, 0x01, 0x01], 0);
+        let mut mon = AnnouncementMonitor::new();
+        let events = mon.observe(&enc, Some(1000));
+        assert!(events.is_empty()); // no FIG 0/19 yet
+
+        enc.parse_fig0_ext19(&[0x01, 0x00, 0x02, 0x80 | 50]);
+        let events = mon.observe(&enc, Some(2000));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].phase, traffic::AnnouncementPhase::Started);
+        assert_eq!(events[0].cluster_id, 1);
+        assert_eq!(events[0].subchannel_id, 50);
+        assert!(events[0].traffic_relevant);
+
+        // Same announcement still present, new_flag cleared → continuing (no emit by default)
+        enc.announcement_switching.clear();
+        enc.parse_fig0_ext19(&[0x01, 0x00, 0x02, 50]);
+        let events = mon.observe(&enc, Some(3000));
+        assert!(events.is_empty());
+
+        // Cluster disappears → ended
+        enc.announcement_switching.clear();
+        let events = mon.end_missing(&enc, Some(4000));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].phase, traffic::AnnouncementPhase::Ended);
+    }
 }
 
+/// Tracks FIG 0/19 edges so callers can emit start/end announcement events.
+#[derive(Debug, Default)]
+pub struct AnnouncementMonitor {
+    /// Clusters currently considered active: cluster → last switch state.
+    active: HashMap<u8, AnnouncementSwitch>,
+}
 
+impl AnnouncementMonitor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observe the latest ensemble switching table. Emits `Started` when a
+    /// cluster newly appears or its `new_flag` rises while already tracked.
+    pub fn observe(
+        &mut self,
+        ensemble: &EnsembleInfo,
+        timestamp_unix_ms: Option<u64>,
+    ) -> Vec<traffic::AnnouncementEvent> {
+        let mut events = Vec::new();
+        let eid = ensemble
+            .ensemble_id
+            .map(|e| format!("0x{e:04X}"));
+        for (cluster, sw) in &ensemble.announcement_switching {
+            if sw.asw_flags == 0 {
+                continue;
+            }
+            let supporting: Vec<String> = ensemble
+                .services_in_announcement_cluster(*cluster)
+                .into_iter()
+                .map(|sid| {
+                    if sid > 0xFFFF {
+                        format!("0x{sid:08X}")
+                    } else {
+                        format!("0x{sid:04X}")
+                    }
+                })
+                .collect();
+            match self.active.get(cluster) {
+                None => {
+                    events.push(traffic::AnnouncementEvent::started(
+                        sw.cluster_id,
+                        sw.subchannel_id,
+                        sw.asw_flags,
+                        sw.new_flag,
+                        sw.region_id,
+                        supporting,
+                        eid.clone(),
+                        timestamp_unix_ms,
+                    ));
+                    self.active.insert(*cluster, sw.clone());
+                }
+                Some(prev) if sw.new_flag && !prev.new_flag => {
+                    events.push(traffic::AnnouncementEvent::started(
+                        sw.cluster_id,
+                        sw.subchannel_id,
+                        sw.asw_flags,
+                        true,
+                        sw.region_id,
+                        supporting,
+                        eid.clone(),
+                        timestamp_unix_ms,
+                    ));
+                    self.active.insert(*cluster, sw.clone());
+                }
+                Some(_) => {
+                    self.active.insert(*cluster, sw.clone());
+                }
+            }
+        }
+        events
+    }
+
+    /// Emit `Ended` for any previously active cluster absent from the current
+    /// switching table (or present with ASw == 0). Call once per OFDM frame
+    /// after FIBs for that frame have been ingested.
+    pub fn end_missing(
+        &mut self,
+        ensemble: &EnsembleInfo,
+        timestamp_unix_ms: Option<u64>,
+    ) -> Vec<traffic::AnnouncementEvent> {
+        let eid = ensemble
+            .ensemble_id
+            .map(|e| format!("0x{e:04X}"));
+        let mut ended = Vec::new();
+        let still: std::collections::HashSet<u8> = ensemble
+            .announcement_switching
+            .iter()
+            .filter(|(_, sw)| sw.asw_flags != 0)
+            .map(|(c, _)| *c)
+            .collect();
+        let gone: Vec<u8> = self
+            .active
+            .keys()
+            .copied()
+            .filter(|c| !still.contains(c))
+            .collect();
+        for cluster in gone {
+            if let Some(sw) = self.active.remove(&cluster) {
+                let supporting: Vec<String> = ensemble
+                    .services_in_announcement_cluster(cluster)
+                    .into_iter()
+                    .map(|sid| {
+                        if sid > 0xFFFF {
+                            format!("0x{sid:08X}")
+                        } else {
+                            format!("0x{sid:04X}")
+                        }
+                    })
+                    .collect();
+                ended.push(traffic::AnnouncementEvent::ended(
+                    sw.cluster_id,
+                    sw.subchannel_id,
+                    sw.asw_flags,
+                    supporting,
+                    eid.clone(),
+                    timestamp_unix_ms,
+                ));
+            }
+        }
+        ended
+    }
+}

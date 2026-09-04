@@ -712,9 +712,14 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     traffic: bool,
 
-    /// Dump parsed FIG 0/0–0/3, 0/8, 0/13 as JSON after processing
+    /// Emit DAB Traffic Announcement events (FIG 0/18 support + FIG 0/19 switching)
+    /// as JSON lines (bearer dab-announcement). Distinct from TPEG GeoJSON.
+    #[arg(long, default_value_t = false)]
+    announcements: bool,
+
+    /// Dump parsed FIG 0/0–0/3, 0/8, 0/13, 0/18, 0/19 as JSON after processing
     /// the full input (or --max-frames). Accumulates FIGs across the whole run
-    /// so late FIG 0/13 is not missed.
+    /// so late FIG 0/13 / 0/18 announcements are not missed.
     #[arg(long, default_value_t = false)]
     dump_fic: bool,
 
@@ -954,6 +959,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut traffic_initialized = false;
     let mut traffic_features: Vec<traffic::TrafficFeature> = Vec::new();
     let mut packet_crc_warned = false;
+    let mut announcement_monitor = fic::fib::AnnouncementMonitor::new();
+    let mut announcement_events: Vec<traffic::AnnouncementEvent> = Vec::new();
+    // All FIG 0/19 entries observed during the run (for --dump-fic).
+    let mut announcement_switching_seen: std::collections::HashMap<u8, fic::fib::AnnouncementSwitch> =
+        std::collections::HashMap::new();
 
     let app_running = Arc::new(AtomicBool::new(true));
     let tui_state = Arc::new(Mutex::new(TuiState {
@@ -1310,9 +1320,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let fic_ratio = ((fibs.len() as f32 / 12.0) * 100.0).round().min(100.0) as u8;
                 ofdm_processor.set_fic_decode_ratio(fic_ratio);
 
+                // FIG 0/19 is only present while an announcement is active; clear
+                // the prior frame's switching table so absence can be detected.
+                if cli.announcements {
+                    for (k, v) in ensemble.announcement_switching.drain() {
+                        announcement_switching_seen.insert(k, v);
+                    }
+                }
+
                 for fib in &fibs {
                     fib_count += 1;
                     ensemble.parse_fib(fib);
+                }
+                if !ensemble.announcement_switching.is_empty() {
+                    for (k, v) in &ensemble.announcement_switching {
+                        announcement_switching_seen.insert(*k, v.clone());
+                    }
+                }
+                if cli.announcements {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_millis() as u64);
+                    for ev in announcement_monitor.observe(&ensemble, ts) {
+                        if !cli.json {
+                            info!(
+                                phase = ?ev.phase,
+                                cluster = ev.cluster_id,
+                                subch = ev.subchannel_id,
+                                types = ?ev.announcement_types,
+                                "Announcement"
+                            );
+                        }
+                        println!("{}", ev.to_json());
+                        announcement_events.push(ev);
+                    }
+                    for ev in announcement_monitor.end_missing(&ensemble, ts) {
+                        if !cli.json {
+                            info!(
+                                phase = ?ev.phase,
+                                cluster = ev.cluster_id,
+                                subch = ev.subchannel_id,
+                                "Announcement ended"
+                            );
+                        }
+                        println!("{}", ev.to_json());
+                        announcement_events.push(ev);
+                    }
                 }
                 if frame_count <= 5 || frame_count.is_multiple_of(50) {
                     debug!(
@@ -1834,12 +1888,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.dump_fic {
         ensemble.resolve_services();
+        // Prefer the accumulated switching history when --announcements cleared
+        // the live table each frame.
+        if ensemble.announcement_switching.is_empty() && !announcement_switching_seen.is_empty() {
+            ensemble.announcement_switching = announcement_switching_seen.clone();
+        }
         print_fic_dump(&ensemble, frame_count, fib_count);
-        if !cli.traffic && !cli.dump_packets {
+        if !cli.traffic && !cli.dump_packets && !cli.announcements {
             return Ok(());
         }
     }
 
+    if cli.announcements && !cli.json {
+        info!(
+            events = announcement_events.len(),
+            support_services = ensemble.announcement_support.len(),
+            "Announcement summary"
+        );
+        for (sid, s) in &ensemble.announcement_support {
+            if traffic::is_traffic_relevant(s.asu_flags) {
+                info!(
+                    service = %format_service_id(*sid),
+                    label = ensemble.services.get(sid).and_then(|x| x.label.as_deref()).unwrap_or(""),
+                    asu = format!("0x{:04X}", s.asu_flags),
+                    types = ?traffic::announcement_type_names(s.asu_flags),
+                    clusters = ?s.cluster_ids,
+                    "Traffic-relevant FIG 0/18 support"
+                );
+            }
+        }
+    }
 
     if cli.traffic || cli.dump_packets {
         let mut stats_rows = Vec::new();
@@ -1978,7 +2056,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!(path = %path, "Wrote decoded WAV audio");
             }
         }
-    } else if !cli.traffic && !cli.dump_packets {
+    } else if !cli.traffic && !cli.dump_packets && !cli.announcements {
         // Just print service listing
         let output = ensemble.to_output();
 
@@ -2404,6 +2482,29 @@ fn print_fic_dump(ensemble: &fic::fib::EnsembleInfo, frame_count: usize, fib_cou
         }).collect::<Vec<_>>(),
         "fig_0_13_flat": fig013_flat,
         "tpeg_ua_type_0x004": tpeg_hits,
+        "announcement_support": ensemble.announcement_support.iter().map(|(sid, s)| {
+            serde_json::json!({
+                "sid": format_service_id(*sid),
+                "asu_flags": format!("0x{:04X}", s.asu_flags),
+                "asu_flags_dec": s.asu_flags,
+                "announcement_types": traffic::announcement_type_names(s.asu_flags),
+                "traffic_relevant": traffic::is_traffic_relevant(s.asu_flags),
+                "cluster_ids": s.cluster_ids,
+            })
+        }).collect::<Vec<_>>(),
+        "announcement_switching": ensemble.announcement_switching.values().map(|sw| {
+            serde_json::json!({
+                "cluster_id": sw.cluster_id,
+                "asw_flags": format!("0x{:04X}", sw.asw_flags),
+                "asw_flags_dec": sw.asw_flags,
+                "announcement_types": traffic::announcement_type_names(sw.asw_flags),
+                "traffic_relevant": traffic::is_traffic_relevant(sw.asw_flags),
+                "new_flag": sw.new_flag,
+                "region_flag": sw.region_flag,
+                "subchannel_id": sw.subchannel_id,
+                "region_id": sw.region_id,
+            })
+        }).collect::<Vec<_>>(),
         "user_applications": ensemble.user_applications.iter().map(|((sid, scids), apps)| {
             serde_json::json!({
                 "sid": format_service_id(*sid),
