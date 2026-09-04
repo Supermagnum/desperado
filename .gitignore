@@ -10,3 +10,6 @@ Icon\r
 analysis/
 lessons_learned.md
 plan.md
+
+# Local SDR captures and FIC dumps (multi-GB; not in git)
+IQ-files/
