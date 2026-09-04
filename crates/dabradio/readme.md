@@ -1,390 +1,335 @@
-<div align="center">
-  <img src="logo.png" alt="Desperado Logo" width="200"/>
-</div>
+# dabradio — DAB/DAB+ Digital Radio Decoder
 
-# Desperado
+A high-performance, production-ready decoder for DAB (Digital Audio Broadcasting) and DAB+ signals. Reads IQ samples from files or SDRs and decodes ensemble information, service listings, and audio streams in real-time.
 
-_A unified Rust library for reading I/Q samples from files, SDR devices, and streams_
+![dabradio screenshot](dabradio.png)
 
-[![Crates.io](https://img.shields.io/crates/v/desperado.svg)](https://crates.io/crates/desperado)
-[![Documentation](https://docs.rs/desperado/badge.svg)](https://docs.rs/desperado)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![CI](https://github.com/xoolive/desperado/workflows/Rust/badge.svg)](https://github.com/xoolive/desperado/actions)
+## Features
 
-Desperado is a library designed to factorize and reuse code for reading I/Q samples from files, SDR devices, and other sources.
+- **Full DAB/DAB+ decoding pipeline** — OFDM sync, FIC/MSC extraction, Viterbi FEC, AAC audio
+- **Multi-service support** — List all available services or decode a specific one
+- **Robust synchronization** — Handles frame alignment drift due to dropped samples or clock errors
+- **DAB+ audio output** — AAC-LC and HE-AAC v2 decoding via fdk-aac, 48 kHz stereo output
+- **Programme Associated Data (PAD)** — Extract DLS text metadata and MOT slideshow images
+  - **DLS (Dynamic Label Segment)**: Song titles, artist names, and text metadata
+  - **MOT (Multimedia Object Transfer)**: Album art and slideshow images (JPEG/PNG)
+- **JSON output** — Service listings as JSON for programmatic access
+- **Packet-mode data** — FIG 0/3, 0/8, 0/13; MSC packet reassembly; TPEG/TEC GeoJSON when UAtype 0x004 is signalled
+- **Multiple input formats** — cu8, cs8, cs16, cf32 IQ samples from files or network streams
+- **Real-time audio playback** — Streams decoded audio directly to soundcard via tinyaudio
+- **Cross-platform** — Tested on Linux x86_64 and macOS Apple Silicon
 
-Desperado provides a unified interface for iterating (synchronously) and streaming (asynchronously) complex I/Q samples in `Complex<f32>` format.
+## Building
 
-The library intentionally does not include demodulation, focusing instead on providing a consistent interface over various sources.
+```bash
+# From the desperado workspace root:
+cargo build --release -p dabradio
 
-The name "Desperado" is a playful nod to DSP (Digital Signal Processing), and tips its hat to <https://www.youtube.com/watch?v=-q93wc3-deU>.
-
-## What are I/Q Samples?
-
-I/Q (In-phase/Quadrature) samples are the fundamental representation of radio signals in software-defined radio (SDR). They represent complex numbers where:
-
-- **I (In-phase)**: The real component, representing the signal along the cosine axis
-- **Q (Quadrature)**: The imaginary component, representing the signal along the sine axis
-
-Together, I and Q samples capture both the amplitude and phase information of a radio signal, allowing software to process, demodulate, and analyze RF signals that have been digitized by SDR hardware.
-
-Desperado abstracts away the complexity of reading these samples from various sources (files, devices, network streams), providing a consistent interface regardless of the source or format (8-bit, 16-bit, float, etc.).
-
-## Installation
-
-Add Desperado to your `Cargo.toml`:
-
-```toml
-[dependencies]
-desperado = "0.1"
+# RTL-SDR, Airspy, and HackRF are enabled by default.
+# Add SoapySDR explicitly when needed:
+cargo build --release -p dabradio --features soapy
 ```
 
-### With SDR device support
-
-To use hardware SDR devices, enable the appropriate feature flags:
-
-```toml
-[dependencies]
-desperado = { version = "0.1", features = ["rtlsdr"] }  # For RTL-SDR devices
-# or
-desperado = { version = "0.1", features = ["airspy"] }  # For Airspy devices (R2, Mini, HF+)
-# or
-desperado = { version = "0.1", features = ["hackrf"] }  # For HackRF devices
-# or
-desperado = { version = "0.1", features = ["soapy"] }   # For SoapySDR-compatible devices
-# or
-desperado = { version = "0.1", features = ["pluto"] }   # For Adalm-Pluto devices
-```
-
-### Available features
-
-- **`rtlsdr`**: RTL-SDR device support (DVB-T dongles) via pure-Rust `rs_rtl` crate
-- **`airspy`**: Airspy device support (R2, Mini, HF+) via pure-Rust `rs_spy` crate
-- **`hackrf`**: HackRF device support via pure-Rust `rs_hackrf` crate (nusb backend)
-- **`soapy`**: SoapySDR device support (LimeSDR, BladeRF, etc.)
-- **`pluto`**: Adalm-Pluto SDR support
-
-The following features are only needed for examples:
-
-- **`clap`**: Command-line argument parsing for examples
-- **`waterfall`**: Waterfall plot visualization example
-- **`audio`**: FM demodulation examples with audio output
-
-## Dependent projects
-
-This Desperado workspace includes several specialized crates built on top of the core I/Q streaming library:
-
-- **[fmradio](crates/fmradio)** - FM radio receiver with RDS data decoding, RDS-TMC ALERT-C, and adaptive audio resampling
-- **[dabradio](crates/dabradio)** - DAB/DAB+ digital radio decoder with OFDM, AAC audio, packet-mode data, and TPEG/TEC
-- **[traffic](crates/traffic)** - Shared TPEG/TEC and RDS-TMC application layer (GeoJSON)
-- **[voracious](crates/voracious)** - VOR/ILS/DME aviation navigation signal decoder
-
-External projects that depend on Desperado for I/Q streaming:
-
-- **[jet1090](https://github.com/xoolive/jet1090)** - Real-time ADS-B decoder for tracking aircraft
-- **[ship162](https://github.com/xoolive/ship162)** - Real-time AIS decoder for tracking maritime vessels
-- **[datalink](https://github.com/xoolive/datalink)** - VDL2 and ARINC 629 aviation datalink decoder
-
-If you're using Desperado in your project, feel free to open a PR to add it here!
+The binary will be at `target/release/dabradio`.
 
 ## Usage
 
-### Basic example (synchronous version)
-
-```rust ignore
-use desperado::{IqFormat, IqSource};
-
-fn main() -> desperado::Result<()> {
-    // Create an IQ source from a binary file
-    let path = "sample.iq";
-    let sample_rate = 96_000;
-    let center_freq = 162_000_000;
-    let chunk_size = 8136;
-    let iq_format = IqFormat::Cu8;
-
-    for samples in IqSource::from_file(path, center_freq, sample_rate, chunk_size, iq_format)? {
-        for s in samples? {  // samples is a Result<Vec<Complex<f32>>, _>
-            println!("  I: {}, Q: {}", s.re, s.im);
-        }
-    }
-    Ok(())
-}
-```
-
-### RTL-SDR (async version)
-
-Access to RTL-SDR devices is provided with the `rtlsdr` feature enabled.
-
-```rust ignore
-use desperado::IqAsyncSource;
-use futures::StreamExt;
-
-#[tokio::main]
-async fn main() -> desperado::Result<()> {
-    let device_index = 0;
-    let sample_rate = 2_400_000;
-    let center_freq = 1_090_000_000;
-    let gain = Some(496);
-
-    let reader = IqAsyncSource::from_rtlsdr(device_index, center_freq, sample_rate, gain).await?;
-
-    while let Some(samples) = reader.next().await {
-        // Process samples...
-    }
-
-    Ok(())
-}
-```
-
-### More data sources
-
-Desperado supports various data sources: the following table summarizes the available sources.
-
-Methods are available in both synchronous (`IqSource`) and asynchronous (`AsyncIqSource`) versions.
-
-| **Frontend**   | Method name                    | Optional feature | Identifier       |
-| -------------- | ------------------------------ | ---------------- | ---------------- |
-| I/Q File       | `[Async]IqSource::from_file`   |                  | file name        |
-| Standard Input | `[Async]IqSource::from_stdin`  |                  |
-| TCP socket     | `[Async]IqSource::from_tcp`    |                  | address and port |
-| RTL-SDR        | `[Async]IqSource::from_rtlsdr` | `rtlsdr`         | device index     |
-| Airspy         | `[Async]IqSource::from_airspy` | `airspy`         | device index     |
-| HackRF         | `[Async]IqSource::from_hackrf` | `hackrf`         | device index     |
-| Soapy          | `[Async]IqSource::from_soapy`  | `soapy`          | device arguments |
-| Adalm-Pluto    | `[Async]IqSource::from_pluto`  | `pluto`          | URI              |
-
-All samples are returned as `Complex<f32>` values, regardless of the source.
-
-- The `rtlsdr` feature enables support for RTL-SDR devices (DVB-T dongles). It is based on the [`rtl-sdr-rs`](https://crates.io/crates/rtl-sdr-rs) crate which is a pure Rust implementation of the RTL-SDR driver.
-- The `airspy` feature enables support for Airspy devices (R2, Mini, HF+). It is based on the `rs_spy` crate, a pure Rust implementation using `nusb` for USB access. Airspy hardware outputs real samples from a single ADC; the driver performs Fs/4 frequency translation and half-band filtering to produce proper I/Q output.
-- The `hackrf` feature enables support for HackRF One devices. It is based on the `rs_hackrf` crate, a pure Rust implementation using `nusb` for USB access. HackRF outputs interleaved 8-bit signed I/Q samples (Cs8) directly over USB. The driver supports per-element gain control (LNA, VGA, amp) and bias-tee power.
-- The `soapy` feature enables support for SoapySDR-compatible devices (LimeSDR, BladeRF, etc.). It is based on the [`soapysdr`](https://crates.io/crates/soapysdr) crate which provides Rust bindings to the SoapySDR C++ library. **The SoapySDR library must be installed separately**.
-- The `pluto` feature enables support for Adalm-Pluto devices. It is based on the [`pluto-sdr`](https://crates.io/crates/pluto-sdr) crate which provides Rust bindings to the libiio C library. **The libiio library must be installed separately**.
-
-Contributions to include more SDR frontends (LimeSDR, BladeRF, etc.) **or to port existing ones to pure Rust implementations** are welcome.
-
-## Shared SDR settings
-
-Applications can use `desperado::sdr::SdrSettings` and the shared device path structs to parse common SDR options consistently. A missing value (`None`) means the user did not specify it and the application should apply its own protocol/device default. This is distinct from `gain = "auto"`, which becomes `Gain::Auto` and explicitly requests device automatic gain control.
-
-Common settings include `center_freq`, `sample_rate`, `gain`, `bias_tee`, `freq_correction_ppm`, `iq_format`, and HackRF `amp_enable`. Per-stage gain should use `Gain::Elements`, for example `{ LNA = 32, VGA = 20 }`; HackRF RF amplifier control is boolean (`amp_enable`), not a numeric gain.
-
-## Sync vs Async: Which should I use?
-
-Desperado provides both synchronous (`IqSource`) and asynchronous (`AsyncIqSource`) interfaces. Here's how to choose:
-
-Use Synchronous (`IqSource`) when:
-
-- **Processing files offline**: Reading recorded I/Q files for analysis
-- **Simple applications**: You don't need concurrent operations
-- **Blocking is acceptable**: Your application can wait for I/O
-- **Easier to reason about**: Simpler control flow
-
-Use Asynchronous (`AsyncIqSource`) when:
-
-- **Real-time processing**: Working with live SDR devices
-- **Concurrent operations**: Processing multiple streams simultaneously
-- **Non-blocking required**: Your application must remain responsive
-- **Integrating with async ecosystem**: Using tokio, async-std, etc.
-
-**Performance note**: For single-threaded file processing, synchronous can be faster due to less overhead. For real-time SDR applications, async is typically better.
-
-## Performance Tuning
-
-### Chunk Size Selection
-
-The `chunk_size` parameter determines how many I/Q samples are read in each iteration. Choosing the right size affects both performance and latency:
-
-**General guidelines**:
-
-- **Small chunks (1K-4K samples)**: Lower latency, more overhead, good for interactive applications
-- **Medium chunks (8K-16K samples)**: Balanced performance, recommended for most applications
-- **Large chunks (32K-64K samples)**: Better throughput, higher latency, good for batch processing
-
-**Example for different use cases**:
-
-```rust,ignore
-// Real-time ADS-B decoding (low latency needed)
-let source = IqSource::from_file(path, freq, rate, 4096, format)?;
-
-// General SDR processing (balanced)
-let source = IqSource::from_file(path, freq, rate, 16384, format)?;
-
-// Batch file processing (maximum throughput)
-let source = IqSource::from_file(path, freq, rate, 65536, format)?;
-```
-
-### Hardware SDR Performance
-
-**RTL-SDR tips**:
-
-- Sample rates above 2.4 MS/s may cause USB bandwidth issues
-- Use manual gain instead of AGC for better performance
-- On Linux, consider increasing USB buffer size: `sudo modprobe rtl2832_sdr buffering=1`
-
-**SoapySDR tips**:
-
-- Check device-specific documentation for optimal buffer sizes
-- Some devices benefit from specific stream arguments
-- Monitor for dropped samples with verbose logging
-
-**PlutoSDR tips**:
-
-- Buffer sizes should match your processing requirements
-- Network latency affects performance for IP-connected devices
-- Use USB 3.0 connections when possible
-
-**Airspy tips**:
-
-- The R2 supports sample rates of 2.5 and 10 MSPS; the Mini supports 3 and 6 MSPS
-- Uses pure-Rust USB access (nusb) — no system driver needed
-- Gain modes: manual (LNA/Mixer/IF), linearity, or sensitivity
-
-**HackRF tips**:
-
-- Supports up to 20 MSPS with 8-bit I/Q samples
-- Uses pure-Rust USB access (nusb) — no system driver needed
-- Control LNA (0–40 dB), VGA (0–62 dB), and 14 dB RF amplifier independently
-- Bias-tee output available for powering external LNAs
-
-### Format Considerations
-
-Different I/Q formats have different performance characteristics:
-
-| Format | Bandwidth | Precision | Use Case                               |
-| ------ | --------- | --------- | -------------------------------------- |
-| Cu8    | Lowest    | 8-bit     | RTL-SDR, bandwidth-limited scenarios   |
-| Cs8    | Low       | 8-bit     | Signed 8-bit devices                   |
-| Cs16   | Medium    | 16-bit    | Higher dynamic range, Airspy, PlutoSDR |
-| Cf32   | Highest   | 32-bit    | Pre-processed files, maximum precision |
-
-**Recommendation**: Use the native format of your source when possible to avoid unnecessary conversions.
-
-## Troubleshooting
-
-### RTL-SDR kernel modules (Linux)
-
-If the RTL kernel modules are installed you will need to temporarily unload them before using this library as follows:
+### List all services in a DAB ensemble
 
 ```bash
-sudo rmmod rtl2832_sdr
-sudo rmmod dvb_usb_rtl28xxu
-sudo rmmod rtl2832
-sudo rmmod rtl8xxxu
+# cu8 format (RTL-SDR raw samples)
+./target/release/dabradio recording.cu8 --channel 12A
+
+# cf32 format (gqrx raw complex float)
+./target/release/dabradio recording.cf32 --channel 12A --format cf32
+
+# cs16 format (signed 16-bit I/Q)
+./target/release/dabradio recording.cs16 --channel 12A --format cs16
 ```
 
-Failure to do so will result in the following USB error:
+Output:
 
-```sh
-thread 'main' panicked at 'Unable to open SDR device!: Usb(Busy)'
+```
+Ensemble: Métropolitain 2 (EId: 0xF044)
+
+Services:
+SId      Label                SubCh  Bitrate    Protection
+------------------------------------------------------------
+0xF201   FRANCE INTER         8      88 kbps    EEP 3-A
+0xF202   FRANCE CULTURE       10     88 kbps    EEP 3-A
+...
 ```
 
-### RTL-SDR Device Detection
-
-To list available RTL-SDR devices:
+### Decode audio from a specific service
 
 ```bash
-rtl_test
-# or using the workspace example:
-cargo run --example rtl_sdr -p desperado --features rtlsdr
+# Play audio from "FRANCE CULTURE" to soundcard
+./target/release/dabradio recording.cu8 --channel 12A --service "FRANCE CULTURE"
+
+# Decode by hex SId instead of label
+./target/release/dabradio recording.cu8 --channel 12A --service 0xF202
+
+# Save raw DAB+ frames to file (no audio output)
+./target/release/dabradio recording.cu8 --channel 12A --service "FRANCE CULTURE" \
+  --output frames.bin --no-audio
 ```
 
-### Airspy Device Detection
-
-To list available Airspy devices and query firmware versions:
+### Live SDR sources (Phase 6)
 
 ```bash
-cargo run --example airspy_info -p rs-spy
-# or stream a few samples with the integration test:
-cargo run --example airspy_test -p desperado --features airspy
+# RTL-SDR (build with --features rtlsdr)
+./target/release/dabradio rtlsdr:// --channel 12A --service "FIP"
+
+# SoapySDR (build with --features soapy)
+./target/release/dabradio soapy://driver=rtlsdr --channel 12A --service "FIP"
+
+# Airspy (build with --features airspy)
+./target/release/dabradio airspy://0 --channel 12A --service "FIP"
 ```
 
-If you get an "I/O Error", the device may need time to reset after the previous run. Unplug and replug the device, or wait ~30 seconds.
+If `freq`/`rate` are not provided in the URI query, `dabradio` injects them from `--channel`/`--freq` and the DAB sample rate (2.048 MHz, or 4.096 MHz for Airspy before 2:1 resampling). Gain follows desperado's shared SDR settings: omitted gain means the DAB default is injected (`rtlsdr`: 29.7 dB, `airspy`: 40 with `gain_mode=linearity`, `hackrf`: 72 plus `amp=true`), while `gain=auto` explicitly requests device automatic gain control where supported.
 
-### HackRF Device Detection
-
-To list available HackRF devices and query firmware/board info:
+### Output formats
 
 ```bash
-cargo run --example hackrf_info -p rs-hackrf
+# JSON service listing
+./target/release/dabradio recording.cu8 --channel 12A --json
+
+# Limit frame processing (useful for testing)
+./target/release/dabradio recording.cu8 --channel 12A --max-frames 100
 ```
 
-If the device appears hung, unplug and replug it. On Linux, ensure you have a udev rule granting access to the USB device (vendor `1d50`, product `6089`):
+### Extract DLS Metadata and MOT Slideshow Images
 
 ```bash
-# /etc/udev/rules.d/52-hackrf.rules
-SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="6089", MODE="0666"
+# DLS text metadata is printed while decoding a service
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP"
+
+# Extract MOT slideshow images to directory (album art, cover art, etc.)
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP" \
+  --slideshow /tmp/fip_slides
+
+# Extract images without audio playback
+./target/release/dabradio recording.cu8 --channel 12A --service "FIP" \
+  --slideshow /tmp/fip_slides --no-audio
 ```
 
-### SoapySDR Device Detection
+**Output example:**
 
-To list available SoapySDR devices:
+```
+$ ls -lah /tmp/fip_slides/
+-rw-r--r-- 1 user user 14279 slide_001.jpg  (JPEG 320×240)
+-rw-r--r-- 1 user user 14279 slide_002.jpg  (JPEG 320×240)
+-rw-r--r-- 1 user user 17639 slide_003.jpg  (JPEG 320×240)
+-rw-r--r-- 1 user user  5416 slide_004.png  (PNG 320×240)
+```
+
+## Command-line Reference
+
+```
+USAGE:
+    dabradio <SOURCE> --channel <CHANNEL> [OPTIONS]
+
+ARGUMENTS:
+    <SOURCE>    File path or SDR URI (rtlsdr://, soapy://, airspy://)
+
+OPTIONS:
+    --channel <CHANNEL>
+            DAB channel (e.g., "12A", "12C")
+
+    -f, --freq <FREQ>
+            Center frequency in Hz (alternative to --channel)
+
+    --format <FORMAT>
+            IQ format for file sources: cu8, cs8, cs16, cf32 [default: cu8]
+
+    --list
+            List services and exit (no audio decoding)
+
+    --json
+            Output as JSON
+
+    --service <SERVICE>
+            Service to decode (label or hex SId like "0xF201")
+
+    -o, --output <OUTPUT>
+            Output file for raw DAB+ logical frames
+
+    --no-audio
+            Disable audio output to soundcard
+
+    --slideshow <DIR>
+            Extract MOT slideshow images to directory
+
+    --max-frames <MAX_FRAMES>
+            Maximum number of OFDM frames to process [default: 0 = unlimited]
+
+    --bypass-deinterleave
+            Debug: skip time de-interleaving in MSC (testing only)
+
+    --dump-fic
+            Dump parsed FIG 0/0–0/3, 0/8, 0/13 as JSON after the full input
+            (accumulates across the whole run; use without --max-frames for a
+            complete FIG 0/13 sweep)
+
+    --dump-packets
+            Decode packet-mode MSC subchannels and print CRC stats as JSON
+
+    --traffic
+            Decode TPEG/TEC (FIG 0/13 UAtype 0x004) and emit GeoJSON
+
+    --location-tables <PATH>
+            Optional TMC/GLR location table (CSV or directory with points.csv)
+
+    -h, --help
+            Print help information
+```
+
+### Packet-mode data and TPEG/TEC
+
+FIG 0/3, FIG 0/8, and FIG 0/13 are parsed so packet-mode components can be
+resolved to a SubChId and packet address. TPEG is only treated as confirmed
+when FIG 0/13 signals user-application type `0x004`. Conditional-access
+components are reported and skipped; they are not descrambled.
 
 ```bash
-SoapySDRUtil --find
+# Inspect FIC (ensemble, packet components, user applications)
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-fic --max-frames 80
+
+# Validate packet-mode MSC (CRC pass rate; chance-level means decode is wrong)
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --dump-packets --max-frames 200
+
+# TPEG/TEC GeoJSON when a TPEG component is present
+./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --traffic
+
+
+# Run all tests
+cargo test -p dabradio
+
+# Run tests with output
+cargo test -p dabradio -- --nocapture
+
+# Check for clippy warnings
+cargo clippy -p dabradio --tests
+
+# Build with optimizations
+cargo build --release -p dabradio
 ```
 
-If your device isn't detected, ensure the appropriate SoapySDR module is installed (e.g., `SoapyRTLSDR`, `SoapyHackRF`, `SoapyLimeSDR`).
+All 45 unit tests pass (2 require external test fixtures and are ignored). 0 clippy warnings.
 
-### Adalm-Pluto Device Detection
+## IQ Format Support
 
-To list available Adalm-Pluto devices:
+
+### Traffic announcements (FIG 0/18 / 0/19)
+
+NRK-style traffic announcements are audio-side stream switching, not packet-mode
+TPEG. `--announcements` emits `AnnouncementEvent` JSON lines
+(`bearer: dab-announcement`) when FIG 0/19 indicates an active cluster:
 
 ```bash
-iio_info -s
+./target/release/dabradio recording.cf32.iq --channel 13E --format cf32 \
+  --dump-fic --announcements
 ```
 
-## Finding I/Q Sample Files
+`--dump-fic` also reports per-service FIG 0/18 support bitmaps when present.
 
-If you need I/Q samples for testing or development:
 
-### Public Datasets
+### cu8 (Unsigned 8-bit I/Q) — Default
 
-- **[IQEngine](https://iqengine.org/)** - Public repository of RF recordings with metadata
-- **[Signal Identification Wiki](https://www.sigidwiki.com/)** - Sample files for various signal types
+Used by RTL-SDR and most software radios.
 
-### Capturing Your Own
+```
+Bytes per sample: 2 (I byte, Q byte)
+Value range: 0-255 → normalized to [-1, +1]
+Conversion: (byte - 127.5) / 128.0
+```
 
-With RTL-SDR:
+### cf32 (Complex 32-bit float)
+
+Used by gqrx, USRP, and advanced SDRs.
+
+```
+Bytes per sample: 8 (I float, Q float)
+Value range: as-is (typically [-1, +1])
+Conversion: direct from IEEE 754 f32 bytes
+```
+
+### cs8, cs16
+
+Signed 8-bit and 16-bit I/Q formats. Specify with `--format cs8` or `--format cs16`.
+
+## Supported DAB Channels
+
+Use `--channel` with standard designations (150-240 MHz band):
+
+```
+5A, 5B, 5C, 5D (174.928-181.936 MHz)
+6A, 6B, 6C, 6D (181.936-188.944 MHz)
+7A, 7B, 7C, 7D (188.944-195.952 MHz)
+8A, 8B, 8C, 8D (195.952-202.960 MHz)
+9A, 9B, 9C, 9D (202.960-209.968 MHz)
+10A, 10B, 10C, 10D (209.968-216.976 MHz)
+11A, 11B, 11C, 11D (216.976-223.984 MHz)
+12A, 12B, 12C, 12D (223.984-230.992 MHz)
+13A, 13B, 13C, 13D (230.992-238.000 MHz)
+```
+
+Or specify frequency directly with `--freq 223936000` (Hz).
+
+## Sample Rate
+
+DAB uses 2.048 MHz sample rate. Ensure your recordings are at exactly 2048000 samples/sec.
+
+## Known Issues & Limitations
+
+1. **MSC decoding requires complete FIC** — services can only be decoded after ensemble info is available (typically 1-2 seconds)
+2. **Single service at a time** — use `--service` to select one service; multiplexing not yet supported
+3. **Soundcard output on Mac** — requires audio device permissions via system settings
+
+## Debugging
+
+Enable trace-level logging to see frequency estimation and synchronization details:
 
 ```bash
-rtl_sdr -f 1090000000 -s 2400000 -n 24000000 adsb_sample.iq
+RUST_LOG=trace ./target/release/dabradio recording.cu8 --channel 12A --max-frames 5
 ```
 
-With SoapySDR:
+Key debug output:
 
-```bash
-SoapySDRUtil --rate=2.4e6 --freq=1090e6 --output=adsb_sample.iq
-```
+- `PRS correlation failed, re-acquiring sync` — frame alignment recovery in progress
+- `DAB+ audio configured` — audio pipeline ready
+- `Fire code sync acquired` — superframe boundary found
 
-### File Formats
+## Dependencies
 
-Desperado supports raw I/Q files in various formats:
+Core:
 
-- **Cu8** (Complex unsigned 8-bit): Most common for RTL-SDR, 2 bytes per sample
-- **Cs8** (Complex signed 8-bit): 2 bytes per sample
-- **Cs16** (Complex signed 16-bit): 4 bytes per sample, common for SoapySDR/Pluto
-- **Cf32** (Complex 32-bit float): 8 bytes per sample, high precision
+- **rustfft** — FFT for OFDM processing
+- **fdk-aac** — AAC audio decoding
+- **reed-solomon** — Forward error correction
+- **tinyaudio** — Cross-platform audio output
+
+Utilities:
+
+- **clap** — command-line parsing
+- **serde/serde_json** — JSON output
+- **tracing** — structured logging
+- **crossbeam-channel** — lock-free audio buffering
+
+## References
+
+- [ETSI EN 300 401 v2.2.1](https://www.etsi.org/deliver/etsi_en/300400_300499/300401/02.02.01_60/en_300401v020201p.pdf) — DAB specification
+- [welle.io](https://github.com/alanthird/DABstar) — reference decoder architecture
+- [FDK-AAC](https://github.com/mstorsjo/fdk-aac) — AAC decoder library
 
 ## Contributing
 
-Contributions are welcome! Here are some ways you can help:
+Contributions welcome! Areas for enhancement:
 
-- **Add SDR device support**: LimeSDR, BladeRF, etc.  
-  Consider pure Rust implementations where possible!
-- **Improve documentation**: Fix typos, add examples, clarify explanations
-- **Report bugs**: Open an issue with details and reproduction steps
-- **Add tests**: Help improve test coverage
-- **Share your project**: Using Desperado? Add it to the "Projects Using Desperado" section!
-
-Please ensure:
-
-- Code follows Rust conventions (`cargo fmt`, `cargo clippy`)
-- All tests pass (`cargo test --all-features`)
-- New features include documentation and tests
-
-For major changes, please open an issue first to discuss the approach.
-
-## License
-
-This project is licensed under the MIT License. See the [license.md](license.md) file for details.
+- [ ] Multiplex multiple services in a single run
+- [ ] Real-time recording from SDRs
+- [ ] TII (Transmitter Identification Information) decoder for SFN detection
+- [ ] WebAssembly/browser decoder
+- [ ] Ensemble metadata export (RSID/PI-code)
+- [ ] JSON output for metadata and MOT images
