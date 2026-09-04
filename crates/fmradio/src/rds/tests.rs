@@ -576,3 +576,64 @@ fn test_rds_parser_has_data() {
     parser.groups_decoded = 1;
     assert!(parser.has_data(), "Should have data after group decoded");
 }
+
+#[test]
+fn group_3a_registers_tmc_aid_and_allocated_group() {
+    let mut parser = RdsParser::new();
+    // Group 3A: GT=3, A=0, allocated group 8A (bits 4-0 = 0x10)
+    let block2 = (3u16 << 12) | 0x10;
+    let ltn = 17u16;
+    let block3 = ltn << 6; // variant 0, LTN=17
+    let block4 = 0xCD46;
+    parser.handle_group([0xF201, block2, block3, block4], [true, true, true, true]);
+    let oda = parser.station_info().oda_info.as_ref().unwrap();
+    assert_eq!(oda.app_id, 0xCD46);
+    assert_eq!(oda.target_group_type, 0x10);
+    assert!(parser.station_info().oda_apps.contains_key(&0x10));
+    assert!(!parser.tmc_is_encrypted());
+}
+
+#[test]
+fn group_8a_decodes_alert_c_after_3a() {
+    let mut parser = RdsParser::new();
+    let block2_3a = (3u16 << 12) | 0x10;
+    parser.handle_group(
+        [0xF201, block2_3a, 17u16 << 6, 0xCD46],
+        [true, true, true, true],
+    );
+
+    // 8A single-group: T=0 F=1 duration=1, event 101, location 0x1234
+    let block2_8a = (8u16 << 12) | 0x08 | 0x01;
+    let y = 101u16; // no diversion, +, extent 0
+    parser.handle_group(
+        [0xF201, block2_8a, y, 0x1234],
+        [true, true, true, true],
+    );
+    let features = parser.take_traffic_features();
+    assert_eq!(features.len(), 1);
+    assert_eq!(features[0].properties.event_code, Some(101));
+    assert_eq!(features[0].properties.location_code, Some(0x1234));
+    assert_eq!(features[0].properties.bearer, "fm-rds-tmc");
+}
+
+#[test]
+fn encrypted_tmc_is_not_decoded() {
+    let mut parser = RdsParser::new();
+    let block2_3a = (3u16 << 12) | 0x10;
+    parser.handle_group(
+        [0xF201, block2_3a, 0, 0xCD46], // LTN=0
+        [true, true, true, true],
+    );
+    let notice = parser.take_traffic_features();
+    assert_eq!(notice.len(), 1);
+    assert_eq!(notice[0].properties.encrypted, Some(true));
+
+    let block2_8a = (8u16 << 12) | 0x08;
+    parser.handle_group(
+        [0xF201, block2_8a, 101, 0x1234],
+        [true, true, true, true],
+    );
+    let features = parser.take_traffic_features();
+    assert!(features.iter().all(|f| f.properties.event_code.is_none()));
+    assert!(features.iter().all(|f| f.properties.encrypted == Some(true)));
+}

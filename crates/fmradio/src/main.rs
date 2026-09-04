@@ -132,6 +132,14 @@ struct Args {
     /// for optimal RDS decoding with redsea
     #[arg(long)]
     resample_out: Option<u32>,
+
+    /// Optional TMC/GLR location-table CSV or directory (points.csv)
+    #[arg(long)]
+    location_tables: Option<String>,
+
+    /// Decode RDS-TMC (ALERT-C) and emit GeoJSON traffic features
+    #[arg(long, default_value_t = false)]
+    traffic: bool,
 }
 
 impl Args {
@@ -966,6 +974,12 @@ async fn run_stereo(
     if tui_mode {
         rds.set_print_json_output(false);
     }
+    if let Some(path) = &args.location_tables {
+        match traffic::LocationTable::load(std::path::Path::new(path)) {
+            Ok(table) => rds.set_location_table(table),
+            Err(e) => warn!(path = %path, error = %e, "Failed to load location table"),
+        }
+    }
 
     let mut audio_resample =
         AudioAdaptiveResampler::new(AUDIO_RATE as f64 / mpx_sample_rate as f64, 5, 2, !tui_mode);
@@ -1042,6 +1056,12 @@ async fn run_stereo(
                             rds = RdsDecoder::new(rds_target_rate, args.verbose >= 2);
                             if tui_mode {
                                 rds.set_print_json_output(false);
+                            }
+                            if let Some(path) = &args.location_tables
+                                && let Ok(table) =
+                                    traffic::LocationTable::load(std::path::Path::new(path))
+                            {
+                                rds.set_location_table(table);
                             }
                             audio_resample = AudioAdaptiveResampler::new(
                                 AUDIO_RATE as f64 / mpx_sample_rate as f64,
@@ -1156,6 +1176,11 @@ async fn run_stereo(
 
         if !rds_i.is_empty() {
             rds.process_iq(&rds_i, &rds_q);
+            if args.traffic {
+                for feature in rds.take_traffic_features() {
+                    println!("{}", feature.to_json());
+                }
+            }
             if let Some(state) = &tui_state
                 && let Ok(mut s) = state.lock()
             {
