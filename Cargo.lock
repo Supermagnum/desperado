@@ -824,6 +824,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "traffic",
  "viuer",
 ]
 
@@ -1191,6 +1192,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "traffic",
 ]
 
 [[package]]
@@ -2168,7 +2170,7 @@ checksum = "c35bccec0ce0967c6ba505aca16bad585ece6ef581c8f784924272093d887987"
 dependencies = [
  "bytemuck",
  "serde_json",
- "thiserror 2.0.18",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3527,6 +3529,15 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "traffic"
+version = "0.4.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
