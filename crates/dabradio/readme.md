@@ -168,7 +168,7 @@ OPTIONS:
             Debug: skip time de-interleaving in MSC (testing only)
 
     --dump-fic
-            Dump parsed FIG 0/0–0/3, 0/8, 0/13 as JSON after the full input
+            Dump parsed FIG 0/0–0/3, 0/8, 0/13, 0/18, 0/19 as JSON after the full input
             (accumulates across the whole run; use without --max-frames for a
             complete FIG 0/13 sweep)
 
@@ -177,6 +177,9 @@ OPTIONS:
 
     --traffic
             Decode TPEG/TEC (FIG 0/13 UAtype 0x004) and emit GeoJSON
+
+    --announcements
+            Emit FIG 0/18/0/19 announcement events (bearer dab-announcement)
 
     --location-tables <PATH>
             Optional TMC/GLR location table (CSV or directory with points.csv)
@@ -202,6 +205,20 @@ components are reported and skipped; they are not descrambled.
 # TPEG/TEC GeoJSON when a TPEG component is present
 ./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --traffic
 
+### Traffic announcements (FIG 0/18 / 0/19)
+
+NRK-style traffic announcements are audio-side stream switching, not packet-mode
+TPEG. `--announcements` emits `AnnouncementEvent` JSON lines
+(`bearer: dab-announcement`) when FIG 0/19 indicates an active cluster:
+
+```bash
+./target/release/dabradio recording.cf32.iq --channel 13E --format cf32 \
+  --dump-fic --announcements
+```
+
+`--dump-fic` also reports per-service FIG 0/18 support bitmaps when present.
+
+
 
 # Run all tests
 cargo test -p dabradio
@@ -219,21 +236,6 @@ cargo build --release -p dabradio
 All 45 unit tests pass (2 require external test fixtures and are ignored). 0 clippy warnings.
 
 ## IQ Format Support
-
-
-### Traffic announcements (FIG 0/18 / 0/19)
-
-NRK-style traffic announcements are audio-side stream switching, not packet-mode
-TPEG. `--announcements` emits `AnnouncementEvent` JSON lines
-(`bearer: dab-announcement`) when FIG 0/19 indicates an active cluster:
-
-```bash
-./target/release/dabradio recording.cf32.iq --channel 13E --format cf32 \
-  --dump-fic --announcements
-```
-
-`--dump-fic` also reports per-service FIG 0/18 support bitmaps when present.
-
 
 ### cu8 (Unsigned 8-bit I/Q) — Default
 

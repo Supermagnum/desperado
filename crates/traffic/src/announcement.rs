@@ -120,6 +120,7 @@ impl AnnouncementEvent {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn started(
         cluster_id: u8,
         subchannel_id: u8,
@@ -151,6 +152,7 @@ impl AnnouncementEvent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn continuing(
         cluster_id: u8,
         subchannel_id: u8,
@@ -175,6 +177,7 @@ impl AnnouncementEvent {
         e
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ended(
         cluster_id: u8,
         subchannel_id: u8,
