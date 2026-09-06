@@ -1399,12 +1399,7 @@ fn convert_bytes_to_complex(format: IqFormat, buffer: &[u8]) -> Vec<Complex<f32>
             // RTL-SDR-native unsigned IQ: recenter on mid-scale then normalize
             // to ±1. Use 127.5 for both steps (not a signed reinterpret, and not
             // `/128` after recentering — that leaves a ~0.4% scale error).
-            .map(|c| {
-                Complex::new(
-                    (c[0] as f32 - 127.5) / 127.5,
-                    (c[1] as f32 - 127.5) / 127.5,
-                )
-            })
+            .map(|c| Complex::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
             .collect(),
         IqFormat::Cs8 => buffer
             .as_chunks::<2>()

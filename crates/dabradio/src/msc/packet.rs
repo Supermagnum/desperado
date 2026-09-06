@@ -333,6 +333,9 @@ mod tests {
         assert_eq!(group.payload_for_dg_flag(true), raw.as_slice());
         // With data groups in use, the same bytes would be stripped as a header.
         assert_ne!(group.payload_for_dg_flag(false), raw.as_slice());
-        assert_eq!(group.payload_for_dg_flag(false), group.application_payload());
+        assert_eq!(
+            group.payload_for_dg_flag(false),
+            group.application_payload()
+        );
     }
 }

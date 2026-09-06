@@ -647,7 +647,10 @@ fn traffic_feature_queue_is_drained_when_not_printed() {
         [true, true, true, true],
     );
     let block2_8a = (8u16 << 12) | 0x08 | 0x01;
-    parser.handle_group([0xF201, block2_8a, 101u16, 0x1234], [true, true, true, true]);
+    parser.handle_group(
+        [0xF201, block2_8a, 101u16, 0x1234],
+        [true, true, true, true],
+    );
 
     let emit = false;
     let mut seen = 0usize;
@@ -666,18 +669,12 @@ fn partial_3a_with_bad_block_c_or_d_does_not_corrupt_oda_state() {
     let mut parser = RdsParser::new();
     let block2 = (3u16 << 12) | 0x10;
     let good_ltn = 17u16 << 6;
-    parser.handle_group(
-        [0xF201, block2, good_ltn, 0xCD46],
-        [true, true, true, true],
-    );
+    parser.handle_group([0xF201, block2, good_ltn, 0xCD46], [true, true, true, true]);
     assert!(!parser.tmc_is_encrypted());
     let before = parser.station_info().oda_apps.clone();
 
     // Valid A/B, corrupted C (LTN=0 would mark encrypted if applied)
-    parser.handle_group(
-        [0xF201, block2, 0, 0xCD46],
-        [true, true, false, true],
-    );
+    parser.handle_group([0xF201, block2, 0, 0xCD46], [true, true, false, true]);
     assert_eq!(parser.station_info().oda_apps, before);
     assert!(!parser.tmc_is_encrypted());
 

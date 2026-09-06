@@ -1567,8 +1567,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(decoded) = ch.msc.feed_symbol(sym) {
                             for (assembler, target) in &mut ch.assemblers {
                                 for group in assembler.feed_bytes(&decoded) {
-                                    let payload =
-                                        group.payload_for_dg_flag(target.no_data_groups);
+                                    let payload = group.payload_for_dg_flag(target.no_data_groups);
                                     debug!(
                                         address = group.address,
                                         bytes = payload.len(),
