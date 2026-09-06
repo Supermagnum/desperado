@@ -199,10 +199,31 @@ A short NRK Riks (channel 12D) cf32 clip is checked in under
 `crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq` (~1.25 s at 2.048 MS/s)
 for FIC lock and FIG dumps without a multi-GB capture.
 
+NRK Riks (12D) and Innland (13E) full sweeps confirmed FIG 0/13 has no
+`UAtype 0x004`. A 2017 Belgian RTBF DAB (12B) cu8 sample from
+[dab-cmdline#27](https://github.com/JvanKatwijk/dab-cmdline/issues/27)
+(`IQ-files/be_12b_20171226.iq`, results in `IQ-files/be_12b_validation/`)
+does carry `UAtype 0x004` on service `TPEG_PACKET` / SId `0xE0606361`
+(SubCh 14, packet address 1, 16 kbps EEP 3-A). That is confirmed by both
+`dabradio --dump-fic` and `welle-cli` `dump.fic` with matching 12-service
+lists. MSC packet CRC on that TPEG subchannel is above chance (~3.4% after
+state-0 Viterbi; ~5.9% with a small sample-rate ppm tweak) but far below the
+~84–91% seen on RIKS/Innland EPG components of the same EEP family. Welch
+spectrum shows no DC spike; `cu8` centering and `--center-freq` NCO mix are
+verified. FIC FIB success on this clip peaks around ~80% vs ~99.9% on the
+cf32 captures, so the remaining gap looks like soft-bit/OFDM quality on the
+2017 RTL sample rather than a puncturing-table bug. `--traffic` is still an
+empty FeatureCollection — transport/TEC e2e is not yet proven on real bytes.
+
 ```bash
 # Inspect FIC (ensemble, packet components, user applications)
 ./target/release/dabradio crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq \
   --channel 12D --format cf32 --dump-fic --max-frames 40
+
+# Belgian 12B cu8 sample (needs +12 kHz capture-center correction on this file)
+./target/release/dabradio IQ-files/be_12b_20171226.iq \
+  --channel 12B --format cu8 --sample-rate 2048000 --center-freq 225660000 \
+  --dump-fic --no-audio
 
 # Validate packet-mode MSC (CRC pass rate; chance-level means decode is wrong)
 # Needs a longer capture than the short fixture; use your own IQ file:
@@ -210,6 +231,7 @@ for FIC lock and FIG dumps without a multi-GB capture.
 
 # TPEG/TEC GeoJSON when a TPEG component is present
 ./target/release/dabradio recording.cf32.iq --channel 12D --format cf32 --traffic
+```
 
 ### Traffic announcements (FIG 0/18 / 0/19)
 

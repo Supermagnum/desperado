@@ -1021,6 +1021,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    // Adaptive baseband DC removal: always considered for RTL-SDR-native cu8
+    // (direct-conversion LO leakage). When digitally downconverting (shift!=0),
+    // force removal before the mix so a capture-center spike cannot become an
+    // in-band tone. Clean cf32/USRP captures with near-zero mean stay below the
+    // adaptive threshold and are left untouched.
+    // Adaptive for cu8 (RTL LO leakage). Force when digitally mixing so a
+    // baseband DC spike cannot become an in-band tone after rotation.
+    // Thresholded adaptive path leaves clean USRP/cf32 captures alone.
+    let mut dc_tracker = AdaptiveDcRemover::new(
+        matches!(iq_format, IqFormat::Cu8) || shift_hz != 0,
+        shift_hz != 0,
+    );
 
     // Audio output setup (tinyaudio + crossbeam channel)
     // Queue is 4 seconds deep — enough to absorb decode bursts.
@@ -1224,22 +1236,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             startup_discard_samples = 0;
             samples = samples.split_off(keep_from);
         }
-        // Remove the SDR/capture DC offset from the raw (pre-rotation) samples
-        // when downconverting. The DC spike sits at the capture center; once
-        // rotated it becomes a tone at the shift frequency that can land in or
-        // near the wanted band and corrupt a weak multiplex (e.g. a neighbour
-        // only ~1 MHz from the capture center). Subtracted before rotation, it
-        // is removed regardless of the target channel. Gated on shift != 0 so
-        // existing on-channel paths (DC at the DAB null carrier) are untouched.
-        if shift_hz != 0 && !samples.is_empty() {
-            let mean = samples
-                .iter()
-                .fold(Complex::new(0.0f32, 0.0f32), |acc, s| acc + *s)
-                / samples.len() as f32;
-            for s in samples.iter_mut() {
-                *s -= mean;
-            }
-        }
+        // Adaptive DC removal before any digital mix. When shift!=0 the spike
+        // would otherwise become an in-band tone after rotation; for cu8 it
+        // also covers on-channel RTL-SDR LO leakage. Thresholded so clean
+        // USRP/cf32 captures are not disturbed.
+        dc_tracker.process(&mut samples);
         let samples = if let Some(ref mut rotator) = iq_rotator {
             rotator.process(&samples)
         } else {
@@ -2358,6 +2359,56 @@ fn format_service_id(sid: u32) -> String {
     }
 }
 
+/// Slow IIR DC tracker for direct-conversion captures.
+///
+/// In adaptive mode, engages only once `|mean|` exceeds `threshold` so clean
+/// USRP/cf32 inputs are not altered. In force mode (digital downconvert),
+/// always subtracts the running mean before the mix — matching the previous
+/// shift!=0 behaviour, with a smoother estimate than per-chunk mean.
+struct AdaptiveDcRemover {
+    enabled: bool,
+    force: bool,
+    mean: Complex<f32>,
+    alpha: f32,
+    threshold: f32,
+    engaged: bool,
+}
+
+impl AdaptiveDcRemover {
+    fn new(enabled: bool, force: bool) -> Self {
+        Self {
+            enabled,
+            force,
+            mean: Complex::new(0.0, 0.0),
+            alpha: 0.05,
+            // ~2% of full-scale after cu8 normalization. The Belgian sample's
+            // residual mean is ~0.001 (no spectral DC spike), so adaptive mode
+            // stays off there while still catching real RTL LO leakage.
+            threshold: 0.02,
+            engaged: false,
+        }
+    }
+
+    fn process(&mut self, samples: &mut [Complex<f32>]) {
+        if !self.enabled || samples.is_empty() {
+            return;
+        }
+        let chunk_mean = samples
+            .iter()
+            .fold(Complex::new(0.0f32, 0.0f32), |acc, s| acc + *s)
+            / samples.len() as f32;
+        self.mean = self.mean * (1.0 - self.alpha) + chunk_mean * self.alpha;
+        if self.force || self.mean.norm() >= self.threshold {
+            self.engaged = true;
+        }
+        if self.engaged {
+            for s in samples.iter_mut() {
+                *s -= self.mean;
+            }
+        }
+    }
+}
+
 struct TrafficChannel {
     msc: msc::MscHandler,
     assemblers: Vec<(msc::packet::PacketAssembler, fic::fib::TpegTarget)>,
@@ -2827,6 +2878,42 @@ mod tests {
             "hackrf://?amp=false&freq=223936000&rate=2048000&gain=72"
         );
         assert_eq!(effective_gain, Some(72.0));
+    }
+
+    #[test]
+    fn adaptive_dc_remover_ignores_clean_signal_below_threshold() {
+        let mut dc = AdaptiveDcRemover::new(true, false);
+        let mut samples = vec![Complex::new(0.001, -0.0005); 256];
+        let before = samples[0];
+        dc.process(&mut samples);
+        assert!(!dc.engaged);
+        assert_eq!(samples[0], before);
+    }
+
+    #[test]
+    fn adaptive_dc_remover_engages_on_large_offset() {
+        let mut dc = AdaptiveDcRemover::new(true, false);
+        let mut samples = vec![Complex::new(0.2, 0.0); 256];
+        // alpha=0.05 → need ~100 chunks to converge the running mean.
+        for _ in 0..120 {
+            dc.process(&mut samples);
+            samples = vec![Complex::new(0.2, 0.0); 256];
+        }
+        assert!(dc.engaged);
+        dc.process(&mut samples);
+        let mean_re = samples.iter().map(|s| s.re).sum::<f32>() / samples.len() as f32;
+        assert!(
+            mean_re.abs() < 0.01,
+            "expected near-zero residual after DC removal, got {mean_re}"
+        );
+    }
+
+    #[test]
+    fn adaptive_dc_remover_force_mode_always_subtracts() {
+        let mut dc = AdaptiveDcRemover::new(true, true);
+        let mut samples = vec![Complex::new(0.001, 0.0); 128];
+        dc.process(&mut samples);
+        assert!(dc.engaged);
     }
 
     #[test]
