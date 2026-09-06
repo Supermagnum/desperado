@@ -128,6 +128,9 @@ pub struct Tpeg2Component {
 }
 
 /// Read an unsigned integer with MSB continuation (ISO 21219-3 IntUnLoMB).
+///
+/// Rejects values that cannot be represented in `u64` *before* shifting, so a
+/// corrupted broadcast stream cannot trip release-profile overflow checks.
 pub fn read_int_unlomb(data: &[u8], pos: &mut usize) -> Option<u64> {
     if *pos >= data.len() {
         return None;
@@ -139,12 +142,13 @@ pub fn read_int_unlomb(data: &[u8], pos: &mut usize) -> Option<u64> {
         }
         let b = data[*pos];
         *pos += 1;
+        // Guard before the shift: `(value << 7)` must not overflow.
+        if value > (u64::MAX >> 7) {
+            return None;
+        }
         value = (value << 7) | u64::from(b & 0x7F);
         if b & 0x80 == 0 {
             return Some(value);
-        }
-        if value > (u64::MAX >> 7) {
-            return None;
         }
     }
 }
@@ -161,16 +165,27 @@ pub fn parse_tpeg2_components(data: &[u8]) -> Vec<Tpeg2Component> {
         let Some(len) = read_int_unlomb(data, &mut pos) else {
             break;
         };
-        let len = len as usize;
-        if pos + len > data.len() {
+        let Ok(len) = usize::try_from(len) else {
+            if start == 0 {
+                return Vec::new();
+            }
+            break;
+        };
+        let Some(end) = pos.checked_add(len) else {
+            if start == 0 {
+                return Vec::new();
+            }
+            break;
+        };
+        if end > data.len() {
             // Not a valid component stream; abort rather than mis-parse.
             if start == 0 {
                 return Vec::new();
             }
             break;
         }
-        let inner = data[pos..pos + len].to_vec();
-        pos += len;
+        let inner = data[pos..end].to_vec();
+        pos = end;
         let children = parse_tpeg2_components(&inner);
         // Nested parse is accepted only when it consumed the inner buffer
         // as a well-formed component list; otherwise treat as a leaf.
@@ -200,7 +215,13 @@ fn component_stream_fits(data: &[u8], children: &[Tpeg2Component]) -> bool {
         let Some(len) = read_int_unlomb(data, &mut pos) else {
             return false;
         };
-        pos += len as usize;
+        let Ok(len) = usize::try_from(len) else {
+            return false;
+        };
+        let Some(next) = pos.checked_add(len) else {
+            return false;
+        };
+        pos = next;
     }
     pos == data.len()
 }
@@ -295,5 +316,35 @@ mod tests {
         assert_eq!(parsed[0].children.len(), 1);
         assert_eq!(parsed[0].children[0].id, 2);
         assert_eq!(parsed[0].children[0].data, b"\x2A");
+    }
+
+    #[test]
+    fn overflowing_int_unlomb_is_rejected_without_panic() {
+        // Ten continuation bytes (0xFF) force a shift that cannot fit in u64.
+        let mut bytes = vec![0xFF; 10];
+        bytes.push(0x7F);
+        let mut pos = 0;
+        assert_eq!(read_int_unlomb(&bytes, &mut pos), None);
+    }
+
+    #[test]
+    fn crc_valid_frame_with_overflowing_component_length_does_not_panic() {
+        // id=1, then an IntUnLoMB length that overflows on decode.
+        let mut payload = vec![0x01];
+        payload.extend(std::iter::repeat_n(0xFF, 10));
+        payload.push(0x7F);
+        let frame = encode_frame(&payload);
+        assert_eq!(find_frames(&frame).len(), 1);
+        assert!(parse_tpeg2_components(&payload).is_empty());
+    }
+
+    #[test]
+    fn component_length_exceeding_usize_add_is_rejected() {
+        // id=1 (single byte), length = a large but representable IntUnLoMB that
+        // cannot be added to `pos` without overflowing usize bounds checks.
+        let mut payload = write_int_unlomb(1);
+        // Encode length = usize::MAX (fits u64 on 64-bit; checked_add with pos fails).
+        payload.extend_from_slice(&write_int_unlomb(usize::MAX as u64));
+        assert!(parse_tpeg2_components(&payload).is_empty());
     }
 }

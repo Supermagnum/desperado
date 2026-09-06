@@ -56,6 +56,18 @@ impl DataGroup {
     pub fn application_payload(&self) -> &[u8] {
         strip_data_group_header(&self.bytes)
     }
+
+    /// Select the bytes to feed an application decoder.
+    ///
+    /// When FIG 0/3 DG=1 (`no_data_groups`), the packet useful-data field *is*
+    /// the application payload — there is no MSC data-group header to strip.
+    pub fn payload_for_dg_flag(&self, no_data_groups: bool) -> &[u8] {
+        if no_data_groups {
+            &self.bytes
+        } else {
+            self.application_payload()
+        }
+    }
 }
 
 /// Assemble packets for a single packet address.
@@ -307,5 +319,20 @@ mod tests {
         stats.crc_ok = 80;
         stats.crc_fail = 20;
         assert!(!stats.is_chance_level());
+    }
+
+    #[test]
+    fn dg_flag_selects_raw_bytes_when_no_data_groups() {
+        // Bytes that look like a data-group header (extension+CRC flags) but are
+        // actually raw application data when DG=1.
+        let raw = vec![0xC0, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let group = DataGroup {
+            address: 852,
+            bytes: raw.clone(),
+        };
+        assert_eq!(group.payload_for_dg_flag(true), raw.as_slice());
+        // With data groups in use, the same bytes would be stripped as a header.
+        assert_ne!(group.payload_for_dg_flag(false), raw.as_slice());
+        assert_eq!(group.payload_for_dg_flag(false), group.application_payload());
     }
 }

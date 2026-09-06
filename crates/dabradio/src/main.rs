@@ -956,7 +956,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     let mut traffic_channels: Vec<TrafficChannel> = Vec::new();
-    let mut traffic_initialized = false;
+    let mut armed_packet_keys: std::collections::HashSet<(u8, u16)> =
+        std::collections::HashSet::new();
+    let mut traffic_no_tpeg_warned = false;
     let mut traffic_features: Vec<traffic::TrafficFeature> = Vec::new();
     let mut packet_crc_warned = false;
     let mut announcement_monitor = fic::fib::AnnouncementMonitor::new();
@@ -1472,28 +1474,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // --dump-fic waits until EOF / --max-frames so FIG 0/13 from the
             // full FIC repetition cycle is accumulated before printing.
-            if (cli.traffic || cli.dump_packets)
-                && !traffic_initialized
-                && (ensemble.is_complete() || frame_count >= 50)
-            {
+            // Packet/TPEG targets are re-evaluated as FIG 0/3 / 0/8 / 0/13
+            // arrive; already-armed MSC handlers are kept.
+            if cli.traffic || cli.dump_packets {
                 ensemble.resolve_services();
-                traffic_channels = init_traffic_channels(
+                merge_traffic_channels(
+                    &mut traffic_channels,
+                    &mut armed_packet_keys,
                     &ensemble,
                     &mut traffic_features,
                     cli.dump_packets,
                     cli.traffic,
                 );
-                traffic_initialized = true;
-                if cli.traffic && ensemble.tpeg_targets().is_empty() && traffic_features.is_empty()
+                if cli.traffic
+                    && !traffic_no_tpeg_warned
+                    && ensemble.is_complete()
+                    && ensemble.tpeg_targets().is_empty()
+                    && traffic_features.is_empty()
                 {
+                    // Advisory only — keep listening; FIG 0/13 may still arrive.
                     warn!(
-                        "No TPEG (UAtype 0x004) packet-mode component found in FIC; \
-                         FIG 0/13 did not confirm the TPEG hypothesis"
+                        "No TPEG (UAtype 0x004) packet-mode component found in FIC yet; \
+                         continuing to watch for late FIG 0/13"
                     );
-                    if is_file_source && !cli.dump_packets {
-                        emit_traffic_output(&traffic_features, cli.json);
-                        return Ok(());
-                    }
+                    traffic_no_tpeg_warned = true;
                 }
             }
 
@@ -1562,10 +1566,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(decoded) = ch.msc.feed_symbol(sym) {
                             for (assembler, target) in &mut ch.assemblers {
                                 for group in assembler.feed_bytes(&decoded) {
-                                    let payload = group.application_payload();
+                                    let payload =
+                                        group.payload_for_dg_flag(target.no_data_groups);
                                     debug!(
                                         address = group.address,
                                         bytes = payload.len(),
+                                        no_data_groups = target.no_data_groups,
                                         "MSC data group"
                                     );
                                     if !cli.traffic || !target.is_tpeg() {
@@ -1923,6 +1929,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if cli.traffic || cli.dump_packets {
+        if cli.traffic && armed_packet_keys.is_empty() && traffic_features.is_empty() {
+            warn!(
+                "No TPEG (UAtype 0x004) packet-mode component found in FIC; \
+                 FIG 0/13 did not confirm the TPEG hypothesis"
+            );
+        }
         let mut stats_rows = Vec::new();
         for ch in &traffic_channels {
             for (assembler, target) in &ch.assemblers {
@@ -2351,23 +2363,43 @@ struct TrafficChannel {
     assemblers: Vec<(msc::packet::PacketAssembler, fic::fib::TpegTarget)>,
 }
 
-fn init_traffic_channels(
+fn traffic_target_key(target: &fic::fib::TpegTarget) -> (u8, u16) {
+    (target.subchannel.id, target.packet_address)
+}
+
+/// Arm new packet-mode targets as FIG information arrives, without resetting
+/// MSC handlers already established for previously seen (subch, address) keys.
+fn merge_traffic_channels(
+    channels: &mut Vec<TrafficChannel>,
+    armed: &mut std::collections::HashSet<(u8, u16)>,
     ensemble: &fic::fib::EnsembleInfo,
     features: &mut Vec<traffic::TrafficFeature>,
     dump_packets: bool,
     decode_tpeg: bool,
-) -> Vec<TrafficChannel> {
+) {
     let targets = if dump_packets {
         ensemble.packet_mode_targets()
     } else {
         ensemble.tpeg_targets()
     };
-    if targets.is_empty() {
-        return Vec::new();
+
+    // Refresh metadata (e.g. late FIG 0/13 UAtypes) on already-armed targets.
+    for ch in channels.iter_mut() {
+        for (_, target) in &mut ch.assemblers {
+            if let Some(updated) = targets
+                .iter()
+                .find(|t| traffic_target_key(t) == traffic_target_key(target))
+            {
+                *target = updated.clone();
+            }
+        }
     }
-    let mut by_subch: std::collections::HashMap<u8, Vec<fic::fib::TpegTarget>> =
-        std::collections::HashMap::new();
+
     for target in targets {
+        let key = traffic_target_key(&target);
+        if armed.contains(&key) {
+            continue;
+        }
         if decode_tpeg && target.is_tpeg() && (target.ca_flag || target.ca_org.is_some()) {
             let mut props = traffic::TrafficProperties::for_bearer(traffic::Bearer::DabTpeg);
             props.unsupported_ca = Some(true);
@@ -2380,6 +2412,7 @@ fn init_traffic_channels(
                 service = %format_service_id(target.service_id),
                 "Skipping CA-protected TPEG component"
             );
+            armed.insert(key);
             continue;
         }
         if target.is_tpeg() {
@@ -2404,33 +2437,33 @@ fn init_traffic_channels(
                 "Packet-mode component (not TPEG)"
             );
         }
-        by_subch
-            .entry(target.subchannel.id)
-            .or_default()
-            .push(target);
-    }
-    let mut channels = Vec::new();
-    for (_, group) in by_subch {
-        let Some(first) = group.first() else {
+
+        let subch_id = target.subchannel.id;
+        let addr = target.packet_address;
+        if let Some(ch) = channels.iter_mut().find(|c| {
+            c.assemblers
+                .first()
+                .is_some_and(|(_, t)| t.subchannel.id == subch_id)
+        }) {
+            ch.assemblers
+                .push((msc::packet::PacketAssembler::new(addr), target));
+            armed.insert(key);
             continue;
-        };
-        let Some(msc) = msc::MscHandler::new(&first.subchannel) else {
+        }
+
+        let Some(msc_handler) = msc::MscHandler::new(&target.subchannel) else {
             warn!(
-                subchannel = first.subchannel.id,
+                subchannel = subch_id,
                 "Failed to initialize packet-mode MSC handler"
             );
             continue;
         };
-        let assemblers = group
-            .into_iter()
-            .map(|t| {
-                let addr = t.packet_address;
-                (msc::packet::PacketAssembler::new(addr), t)
-            })
-            .collect();
-        channels.push(TrafficChannel { msc, assemblers });
+        channels.push(TrafficChannel {
+            msc: msc_handler,
+            assemblers: vec![(msc::packet::PacketAssembler::new(addr), target)],
+        });
+        armed.insert(key);
     }
-    channels
 }
 
 fn print_fic_dump(ensemble: &fic::fib::EnsembleInfo, frame_count: usize, fib_count: usize) {
@@ -2817,5 +2850,97 @@ mod tests {
         assert!(!should_pause_for_tui_selection(
             true, true, false, true, 50, true
         ));
+    }
+
+    fn test_packet_subch(id: u8) -> fic::fib::SubchannelInfo {
+        fic::fib::SubchannelInfo {
+            id,
+            start_addr: 84,
+            sub_size: 6,
+            protection_level: 2,
+            is_eep: true,
+            eep_option: 0,
+            uep_table_index: None,
+            bitrate: 8,
+        }
+    }
+
+    fn ensemble_with_packet_tpeg(with_ua: bool) -> fic::fib::EnsembleInfo {
+        let mut decoder = fic::fib::EnsembleInfo::new();
+        let subch = test_packet_subch(12);
+        decoder.subchannels.insert(12, subch.clone());
+        decoder.packet_components.insert(
+            0x001,
+            fic::fib::PacketComponent {
+                scid: 0x001,
+                subchannel_id: 12,
+                packet_address: 852,
+                dscty: 5,
+                no_data_groups: false,
+                ca_org: None,
+            },
+        );
+        let mut service = fic::fib::ServiceInfo {
+            service_id: 0xF201,
+            label: Some("Pkt".into()),
+            ..Default::default()
+        };
+        let mut component = fic::fib::ServiceComponent {
+            tmid: 3,
+            scid: Some(0x001),
+            subchannel_id: Some(12),
+            packet_address: Some(852),
+            dscty: Some(5),
+            ps_flag: true,
+            ..Default::default()
+        };
+        if with_ua {
+            component.scids = Some(0);
+            component.user_applications = vec![fic::fib::UserApplication {
+                ua_type: fic::fib::UserApplication::TPEG,
+                data: vec![],
+            }];
+            decoder
+                .user_applications
+                .insert((0xF201, 0), component.user_applications.clone());
+        }
+        service.components.push(component);
+        decoder.services.insert(0xF201, service);
+        decoder.resolve_services();
+        decoder
+    }
+
+    #[test]
+    fn merge_traffic_channels_arms_late_tpeg_without_resetting() {
+        let mut channels = Vec::new();
+        let mut armed = std::collections::HashSet::new();
+        let mut features = Vec::new();
+
+        // Completeness without FIG 0/13: nothing to arm for --traffic.
+        let early = ensemble_with_packet_tpeg(false);
+        merge_traffic_channels(
+            &mut channels,
+            &mut armed,
+            &early,
+            &mut features,
+            false,
+            true,
+        );
+        assert!(channels.is_empty());
+        assert!(armed.is_empty());
+
+        // Late FIG 0/13: arm once.
+        let late = ensemble_with_packet_tpeg(true);
+        merge_traffic_channels(&mut channels, &mut armed, &late, &mut features, false, true);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].assemblers.len(), 1);
+        let keys_after_first = armed.clone();
+
+        // Re-merge must not reset or duplicate MSC handlers.
+        merge_traffic_channels(&mut channels, &mut armed, &late, &mut features, false, true);
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].assemblers.len(), 1);
+        assert_eq!(armed, keys_after_first);
+        assert!(channels[0].assemblers[0].1.is_tpeg());
     }
 }

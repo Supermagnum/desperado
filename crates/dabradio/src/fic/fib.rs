@@ -449,15 +449,36 @@ impl EnsembleInfo {
                     component.packet_address = Some(pkt.packet_address);
                     component.dscty = Some(pkt.dscty);
                 }
-                // Keep a single record per (tmid, scid/subch) so repeated FIG 0/2
-                // cycles do not grow the component list without bound.
-                let dup = service.components.iter().any(|c| {
-                    c.tmid == component.tmid
-                        && c.scid == component.scid
-                        && c.subchannel_id == component.subchannel_id
-                });
-                if !dup {
-                    service.components.push(component);
+                // Deduplicate by stable identity. For packet-mode (TMId=3) that is
+                // SCId — subchannel_id is resolved later via FIG 0/3 and must not
+                // create a second entry when it flips from None to Some.
+                if tmid == 3 {
+                    if let Some(existing) = service
+                        .components
+                        .iter_mut()
+                        .find(|c| c.tmid == 3 && c.scid == component.scid)
+                    {
+                        if component.subchannel_id.is_some() {
+                            existing.subchannel_id = component.subchannel_id;
+                        }
+                        if component.packet_address.is_some() {
+                            existing.packet_address = component.packet_address;
+                        }
+                        if component.dscty.is_some() {
+                            existing.dscty = component.dscty;
+                        }
+                        existing.ps_flag = component.ps_flag;
+                        existing.ca_flag = component.ca_flag;
+                    } else {
+                        service.components.push(component);
+                    }
+                } else {
+                    let dup = service.components.iter().any(|c| {
+                        c.tmid == component.tmid && c.subchannel_id == component.subchannel_id
+                    });
+                    if !dup {
+                        service.components.push(component);
+                    }
                 }
 
                 pos += 2;
@@ -1222,6 +1243,82 @@ mod tests {
         assert_eq!(b.packet_address, 20);
         assert!(b.no_data_groups);
         assert_eq!(b.dscty, 60);
+    }
+
+    #[test]
+    fn fig0_2_packet_component_dedupes_by_scid_across_resolution() {
+        let mut decoder = EnsembleInfo::new();
+        let scid: u16 = 0xABC;
+        let b0 = (3 << 6) | ((scid >> 6) as u8);
+        let b1 = ((scid as u8) << 2) | 0x02;
+        // First FIG 0/2 cycle: SCId known, SubChId not yet resolved.
+        decoder.parse_fig0_ext2(&[0xF2, 0x01, 1, b0, b1], 0);
+        assert_eq!(decoder.services.get(&0xF201).unwrap().components.len(), 1);
+        assert!(
+            decoder.services.get(&0xF201).unwrap().components[0]
+                .subchannel_id
+                .is_none()
+        );
+
+        // FIG 0/3 arrives and resolves the SCId.
+        decoder.parse_fig0_ext3(&pack_fig0_3(scid, None, false, 5, 12, 852));
+        // Second FIG 0/2 cycle now carries a resolved SubChId — must update the
+        // existing component, not insert a duplicate keyed on subchannel_id.
+        decoder.parse_fig0_ext2(&[0xF2, 0x01, 1, b0, b1], 0);
+        let service = decoder.services.get(&0xF201).unwrap();
+        assert_eq!(service.components.len(), 1);
+        assert_eq!(service.components[0].scid, Some(scid));
+        assert_eq!(service.components[0].subchannel_id, Some(12));
+        assert_eq!(service.components[0].packet_address, Some(852));
+    }
+
+    #[test]
+    fn late_fig0_13_surfaces_tpeg_target_after_earlier_completeness() {
+        let mut decoder = EnsembleInfo::new();
+        decoder.subchannels.insert(
+            12,
+            SubchannelInfo {
+                id: 12,
+                start_addr: 84,
+                sub_size: 6,
+                protection_level: 2,
+                is_eep: true,
+                eep_option: 0,
+                uep_table_index: None,
+                bitrate: 8,
+            },
+        );
+        decoder.parse_fig0_ext3(&pack_fig0_3(0x001, None, false, 5, 12, 852));
+        let b0 = (3 << 6) | ((0x001u16 >> 6) as u8);
+        let b1 = ((0x001u16 as u8) << 2) | 0x02;
+        decoder.parse_fig0_ext2(&[0xF2, 0x01, 1, b0, b1], 0);
+        decoder.ensemble_id = Some(0x1234);
+        decoder.ensemble_label = Some("TestEns".into());
+        decoder.services.get_mut(&0xF201).unwrap().label = Some("Pkt".into());
+        decoder.resolve_services();
+        // Ensemble looks complete for audio/label purposes, but FIG 0/13 has not
+        // arrived yet — so there is no TPEG target.
+        assert!(decoder.is_complete() || decoder.has_services());
+        assert!(decoder.tpeg_targets().is_empty());
+        assert_eq!(decoder.packet_mode_targets().len(), 1);
+
+        // Late FIG 0/13: must become visible without resetting prior state.
+        let ua_type: u16 = 0x004;
+        decoder.parse_fig0_ext13(
+            &[
+                0xF2,
+                0x01,
+                0x01,
+                (ua_type >> 3) as u8,
+                ((ua_type as u8) << 5) & 0xE0,
+            ],
+            0,
+        );
+        decoder.resolve_services();
+        let targets = decoder.tpeg_targets();
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].is_tpeg());
+        assert_eq!(targets[0].packet_address, 852);
     }
 
     #[test]

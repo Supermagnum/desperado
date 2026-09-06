@@ -300,7 +300,7 @@ pub struct ProgramItemInfo {
 }
 
 /// Open Data Application (ODA) info from Group 3A
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ODAInfo {
     /// Target group type for this ODA (0-15)
     pub target_group_type: u8,
@@ -1454,72 +1454,76 @@ impl RdsParser {
             }
             (3, 0) => {
                 // 3A - Open Data Application (ODA) Registration
-                // Only version A is valid for ODA
-                let target_group_type = (block2 & 0x1F) as u8; // Bits 4..0
-                let oda_app_id = block4;
-                let oda_message = block3;
+                // Only version A is valid for ODA. Require both C and D CRC so a
+                // partial group cannot overwrite a valid registration or mark TMC
+                // encrypted via a corrupted application-info / AID word.
+                if has_block3 && has_block4 {
+                    let target_group_type = (block2 & 0x1F) as u8; // Bits 4..0
+                    let oda_app_id = block4;
+                    let oda_message = block3;
 
-                // Verbose debug output (converted to tracing)
-                if self.verbose {
-                    debug!(
-                        "  [ODA] Target Group: {}A, App ID: 0x{:04X} ({})",
-                        target_group_type,
-                        oda_app_id,
-                        Self::oda_app_name(oda_app_id)
-                    );
-                }
-
-                let oda = ODAInfo {
-                    target_group_type,
-                    app_id: oda_app_id,
-                    message: oda_message,
-                };
-                self.station_info.oda_info = Some(oda.clone());
-                self.station_info.oda_apps.insert(target_group_type, oda);
-                json_out.oda_aid = Some(format!("0x{oda_app_id:04X}"));
-
-                if is_tmc_aid(oda_app_id) {
+                    // Verbose debug output (converted to tracing)
                     if self.verbose {
-                        debug!("    [TMC] ALERT-C system info: 0x{:04X}", oda_message);
-                    }
-                    if let Some(feature) = self.tmc.handle_system_group(oda_message) {
-                        self.traffic_features.push(feature.clone());
-                        json_out.traffic = Some(feature);
-                    }
-                }
-
-                // Handle specific ODA applications
-                match oda_app_id {
-                    0x4BD7 if self.verbose => {
-                        // RadioText+ (RT+)
-                        // Verbose debug output (converted to tracing)
-                        let cb = (oda_message >> 12) & 0x01 != 0;
-                        let scb = (oda_message >> 8) & 0x0F;
-                        let template_num = (oda_message & 0xFF) as u8;
                         debug!(
-                            "    [RT+] CB={}, SCB=0x{:X}, Template={}",
-                            cb, scb, template_num
+                            "  [ODA] Target Group: {}A, App ID: 0x{:04X} ({})",
+                            target_group_type,
+                            oda_app_id,
+                            Self::oda_app_name(oda_app_id)
                         );
                     }
-                    0x6552 if self.verbose => {
-                        // Enhanced RadioText (eRT)
-                        // Verbose debug output (converted to tracing)
-                        let encoding = if (oda_message & 0x01) != 0 {
-                            "UTF-8"
-                        } else {
-                            "UCS2"
-                        };
-                        let direction = if (oda_message & 0x02) != 0 {
-                            "RTL"
-                        } else {
-                            "LTR"
-                        };
-                        debug!("    [eRT] Encoding={}, Direction={}", encoding, direction);
+
+                    let oda = ODAInfo {
+                        target_group_type,
+                        app_id: oda_app_id,
+                        message: oda_message,
+                    };
+                    self.station_info.oda_info = Some(oda.clone());
+                    self.station_info.oda_apps.insert(target_group_type, oda);
+                    json_out.oda_aid = Some(format!("0x{oda_app_id:04X}"));
+
+                    if is_tmc_aid(oda_app_id) {
+                        if self.verbose {
+                            debug!("    [TMC] ALERT-C system info: 0x{:04X}", oda_message);
+                        }
+                        if let Some(feature) = self.tmc.handle_system_group(oda_message) {
+                            self.traffic_features.push(feature.clone());
+                            json_out.traffic = Some(feature);
+                        }
                     }
-                    0xCD46 | 0xCD47 if self.verbose => {
-                        debug!("    [TMC] allocated group bits=0x{target_group_type:02X}");
+
+                    // Handle specific ODA applications
+                    match oda_app_id {
+                        0x4BD7 if self.verbose => {
+                            // RadioText+ (RT+)
+                            // Verbose debug output (converted to tracing)
+                            let cb = (oda_message >> 12) & 0x01 != 0;
+                            let scb = (oda_message >> 8) & 0x0F;
+                            let template_num = (oda_message & 0xFF) as u8;
+                            debug!(
+                                "    [RT+] CB={}, SCB=0x{:X}, Template={}",
+                                cb, scb, template_num
+                            );
+                        }
+                        0x6552 if self.verbose => {
+                            // Enhanced RadioText (eRT)
+                            // Verbose debug output (converted to tracing)
+                            let encoding = if (oda_message & 0x01) != 0 {
+                                "UTF-8"
+                            } else {
+                                "UCS2"
+                            };
+                            let direction = if (oda_message & 0x02) != 0 {
+                                "RTL"
+                            } else {
+                                "LTR"
+                            };
+                            debug!("    [eRT] Encoding={}, Direction={}", encoding, direction);
+                        }
+                        0xCD46 | 0xCD47 if self.verbose => {
+                            debug!("    [TMC] allocated group bits=0x{target_group_type:02X}");
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             (4, 0) => {

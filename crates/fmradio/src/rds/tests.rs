@@ -635,3 +635,61 @@ fn encrypted_tmc_is_not_decoded() {
             .all(|f| f.properties.encrypted == Some(true))
     );
 }
+
+#[test]
+fn traffic_feature_queue_is_drained_when_not_printed() {
+    // Mirrors the main-loop contract: always take_traffic_features(), gate only
+    // printing on --traffic. Without the drain, a long TMC receive grows forever.
+    let mut parser = RdsParser::new();
+    let block2_3a = (3u16 << 12) | 0x10;
+    parser.handle_group(
+        [0xF201, block2_3a, 17u16 << 6, 0xCD46],
+        [true, true, true, true],
+    );
+    let block2_8a = (8u16 << 12) | 0x08 | 0x01;
+    parser.handle_group([0xF201, block2_8a, 101u16, 0x1234], [true, true, true, true]);
+
+    let emit = false;
+    let mut seen = 0usize;
+    for _feature in parser.take_traffic_features() {
+        seen += 1;
+        if emit {
+            unreachable!("emit is false");
+        }
+    }
+    assert!(seen >= 1);
+    assert!(parser.take_traffic_features().is_empty());
+}
+
+#[test]
+fn partial_3a_with_bad_block_c_or_d_does_not_corrupt_oda_state() {
+    let mut parser = RdsParser::new();
+    let block2 = (3u16 << 12) | 0x10;
+    let good_ltn = 17u16 << 6;
+    parser.handle_group(
+        [0xF201, block2, good_ltn, 0xCD46],
+        [true, true, true, true],
+    );
+    assert!(!parser.tmc_is_encrypted());
+    let before = parser.station_info().oda_apps.clone();
+
+    // Valid A/B, corrupted C (LTN=0 would mark encrypted if applied)
+    parser.handle_group(
+        [0xF201, block2, 0, 0xCD46],
+        [true, true, false, true],
+    );
+    assert_eq!(parser.station_info().oda_apps, before);
+    assert!(!parser.tmc_is_encrypted());
+
+    // Valid A/B, corrupted D (would overwrite AID if applied)
+    parser.handle_group(
+        [0xF201, block2, good_ltn, 0x0000],
+        [true, true, true, false],
+    );
+    assert_eq!(parser.station_info().oda_apps, before);
+    assert_eq!(
+        parser.station_info().oda_info.as_ref().unwrap().app_id,
+        0xCD46
+    );
+    assert!(!parser.tmc_is_encrypted());
+}

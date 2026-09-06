@@ -436,9 +436,32 @@ fn tuning_freq_from_center(center_freq_hz: u32, offset_freq_hz: i32) -> u32 {
     }
 }
 
+/// `--traffic` needs stereo RDS decode and must not be combined with modes that
+/// skip RDS or divert MPX away from the decoder.
+fn validate_traffic_flag_combos(mono: bool, raw_out: bool, traffic: bool) -> Result<(), String> {
+    if !traffic {
+        return Ok(());
+    }
+    if mono {
+        return Err(
+            "--traffic requires stereo RDS decode; --mono --traffic is not supported".into(),
+        );
+    }
+    if raw_out {
+        return Err(
+            "--traffic cannot be combined with --raw-out (MPX is diverted before RDS)".into(),
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> desperado::Result<()> {
     let args = Args::parse();
+    if let Err(msg) = validate_traffic_flag_combos(args.mono, args.raw_out, args.traffic) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
 
     // Initialize tracing with verbosity level
     // 0 = WARN (quiet), 1 = INFO, 2 = DEBUG, 3+ = TRACE
@@ -1176,8 +1199,10 @@ async fn run_stereo(
 
         if !rds_i.is_empty() {
             rds.process_iq(&rds_i, &rds_q);
-            if args.traffic {
-                for feature in rds.take_traffic_features() {
+            // Always drain the TMC queue so memory cannot grow unboundedly;
+            // gate only the GeoJSON printing on --traffic.
+            for feature in rds.take_traffic_features() {
+                if args.traffic {
                     println!("{}", feature.to_json());
                 }
             }
@@ -1475,5 +1500,17 @@ mod tests {
             "hackrf://?amp=false&freq=101000000&rate=2000000&gain=72"
         );
         assert_eq!(effective_gain, Some(72.0));
+    }
+
+    #[test]
+    fn traffic_rejects_mono_and_raw_out_combinations() {
+        assert!(validate_traffic_flag_combos(false, false, false).is_ok());
+        assert!(validate_traffic_flag_combos(false, false, true).is_ok());
+        assert!(validate_traffic_flag_combos(true, false, true).is_err());
+        assert!(validate_traffic_flag_combos(false, true, true).is_err());
+        assert!(validate_traffic_flag_combos(true, true, true).is_err());
+        // Non-traffic combinations remain allowed.
+        assert!(validate_traffic_flag_combos(true, false, false).is_ok());
+        assert!(validate_traffic_flag_combos(false, true, false).is_ok());
     }
 }
