@@ -1963,6 +1963,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "groups_complete": assembler.stats.groups_complete,
                     "pass_rate": assembler.stats.crc_pass_rate(),
                     "chance_level": assembler.stats.is_chance_level(),
+                    "first_last_hist": assembler.stats.first_last_hist,
+                    "continuity_gaps": assembler.stats.continuity_gaps,
+                    "useful_zero": assembler.stats.useful_zero,
+                    "command_flag": assembler.stats.command_flag,
+                    "address_match": assembler.stats.address_match,
+                    "seen_addresses": assembler.stats.seen_addresses.iter().zip(assembler.stats.seen_address_counts.iter()).filter(|(_,c)| **c>0).map(|(a,c)| serde_json::json!({"addr": a, "count": c})).collect::<Vec<_>>(),
+                    "crc_ok_addresses": assembler.stats.crc_ok_addresses.iter().zip(assembler.stats.crc_ok_address_counts.iter()).filter(|(_,c)| **c>0).map(|(a,c)| serde_json::json!({"addr": a, "count": c})).collect::<Vec<_>>(),
+                    "fec_frames": assembler.stats.fec_frames,
+                    "fec_desync": assembler.stats.fec_desync,
+                    "fec_rs_fail_rows": assembler.stats.fec_rs_fail_rows,
                 }));
             }
         }

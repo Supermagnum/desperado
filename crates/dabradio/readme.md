@@ -195,9 +195,30 @@ resolved to a SubChId and packet address. TPEG is only treated as confirmed
 when FIG 0/13 signals user-application type `0x004`. Conditional-access
 components are reported and skipped; they are not descrambled.
 
+Packet-mode FEC (EN 300 401 §5.3.5, RS(204,188), FEC packets at address 1022)
+is applied automatically when those packets are seen. Without it, FEC-protected
+muxes show inflated CRC rates on address-0 padding and never reassemble
+target-address data groups.
+
 A short NRK Riks (channel 12D) cf32 clip is checked in under
 `crates/dabradio/tests/data/nrk_riks_12d_short.cf32.iq` (~1.25 s at 2.048 MS/s)
 for FIC lock and FIG dumps without a multi-GB capture.
+
+**GQRX wideband Belgian capture** (not in git; ~695 MiB zstd cf32, centre
+220.936 MHz, 16 MS/s, SHA-256 `7515b924…f3f9f2`):
+
+```bash
+zstd -dc gqrx_….raw.zst | dabradio - --channel 12A --format cf32 \
+  --sample-rate 16000000 --center-freq 220936000 --no-audio \
+  --dump-fic --dump-packets --traffic --announcements
+```
+
+On 12A (`DAB+ VRT`) this confirms FIG 0/13 `UAtype 0x004` (TPEG, SubCh 0,
+addr 1) and live FIG 0/18/0/19 road-traffic announcements. The TPEG
+subchannel’s FEC frames decode cleanly but carry only address-0 padding in
+this clip (`groups_complete=0`). On 12B (`DAB Bruxelles`) the same FEC path
+yields strong packet CRC (~99.8%) and completed EPG/SPI data groups.
+Artifacts: `IQ-files/gqrx_be_validation/`.
 
 NRK Riks (12D) and Innland (13E) full sweeps confirmed FIG 0/13 has no
 `UAtype 0x004`. A 2017 Belgian RTBF DAB (12B) cu8 sample from
@@ -213,7 +234,8 @@ spectrum shows no DC spike; `cu8` centering and `--center-freq` NCO mix are
 verified. FIC FIB success on this clip peaks around ~80% vs ~99.9% on the
 cf32 captures, so the remaining gap looks like soft-bit/OFDM quality on the
 2017 RTL sample rather than a puncturing-table bug. `--traffic` is still an
-empty FeatureCollection — transport/TEC e2e is not yet proven on real bytes.
+empty FeatureCollection on that older clip — transport/TEC e2e is not yet
+proven on real TPEG bytes.
 
 ```bash
 # Inspect FIC (ensemble, packet components, user applications)
